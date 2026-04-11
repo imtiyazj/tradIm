@@ -29,8 +29,7 @@ def get_client() -> anthropic.Anthropic:
     return _client
 
 
-#MODEL = "claude-sonnet-4-5"
-MODEL = "claude-haiku-4-5-20251001"
+MODEL = "claude-sonnet-4-5"
 MAX_TOKENS = 2048
 
 
@@ -166,29 +165,44 @@ Return ONLY a JSON object:
   "notes": "<brief explanation>"
 }}"""
 
+    fallback = {
+        "debt_ratio": None, "interest_income_pct": None,
+        "haram_revenue_pct": None, "ratio_pass": None,
+        "notes": "Ratio data unavailable."
+    }
     try:
         response = get_client().messages.create(
-            model=MODEL,
+            model="claude-haiku-4-5-20251001",
             max_tokens=512,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
+        logger.info(f"Claude ratio raw response for {symbol}: {raw[:200]}")
+
+        if not raw:
+            logger.warning(f"Claude returned empty response for {symbol} ratios")
+            fallback["notes"] = "Claude returned empty response."
+            return fallback
+
+        # Strip markdown code fences if present (```json ... ```)
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(
+                line for line in lines
+                if not line.strip().startswith("```")
+            ).strip()
+
         return json.loads(raw)
+
     except json.JSONDecodeError as e:
-        logger.error(f"Claude JSON parse error in check_financial_ratios: {e}")
-        return {
-            "debt_ratio": None, "interest_income_pct": None,
-            "haram_revenue_pct": None, "ratio_pass": None,
-            "notes": "Could not parse ratio data."
-        }
+        logger.error(f"Claude JSON parse error in check_financial_ratios: {e}\nRaw: {raw!r}")
+        fallback["notes"] = "Could not parse ratio response."
+        return fallback
     except Exception as e:
         logger.error(f"Claude API error in check_financial_ratios: {e}")
-        return {
-            "debt_ratio": None, "interest_income_pct": None,
-            "haram_revenue_pct": None, "ratio_pass": None,
-            "notes": f"API error: {str(e)}"
-        }
+        fallback["notes"] = f"API error: {str(e)}"
+        return fallback
 
 
 # ── 3. Tax analysis ───────────────────────────────────────────────────────────
