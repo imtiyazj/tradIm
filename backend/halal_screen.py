@@ -34,87 +34,117 @@ CACHE_DAYS = 7
 def _zoya_screen(symbol: str) -> dict:
     """
     Call Zoya GraphQL API and return compliance info.
-
-    Returns:
-        {"status": "compliant|non_compliant|doubtful", "sector": "...", "raw": {...}}
+    Auth: pass the API key exactly as stored — Zoya expects it as-is
+    in the Authorization header (key already contains live- prefix).
     """
     query = """
     query GetCompliance($symbol: String!) {
-      compliance(symbol: $symbol) {
-        status
-        businessScreen {
-          verdict
-          activities { name isCompliant }
+      basicCompliance {
+        report(symbol: $symbol) {
+          symbol
+          name
+          exchange
+          status
         }
       }
     }
     """
     headers = {
-        "Authorization": f"Bearer {ZOYA_API_KEY}",
+        "Authorization": ZOYA_API_KEY,
         "Content-Type": "application/json",
     }
     payload = {"query": query, "variables": {"symbol": symbol}}
 
+    logger.info(f"Calling Zoya for {symbol} (key prefix: {ZOYA_API_KEY[:10]}...)")
+
     try:
-        with httpx.Client(timeout=10) as client:
+        with httpx.Client(timeout=15) as client:
             resp = client.post(ZOYA_BASE_URL, json=payload, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
 
-        compliance = data.get("data", {}).get("compliance", {})
-        raw_status = compliance.get("status", "unknown").lower()
+        logger.info(f"Zoya response status: {resp.status_code}")
 
-        # Map Zoya statuses → our enum
+        if resp.status_code == 401:
+            logger.error(f"Zoya 401 — check API key. Response: {resp.text[:200]}")
+            return {"status": HalalStatus.UNKNOWN, "sector": "", "raw": {}}
+
+        resp.raise_for_status()
+        data = resp.json()
+        logger.info(f"Zoya raw response for {symbol}: {data}")
+
+        # Navigate basicCompliance.report path
+        report = (
+            data.get("data", {})
+                .get("basicCompliance", {})
+                .get("report", {})
+        )
+
+        if not report:
+            logger.warning(f"Zoya returned no report for {symbol}: {data}")
+            return {"status": HalalStatus.UNKNOWN, "sector": "", "raw": data}
+
+        raw_status = report.get("status", "unknown").upper()
+        logger.info(f"Zoya status for {symbol}: {raw_status}")
+
         status_map = {
-            "halal":       HalalStatus.COMPLIANT,
-            "compliant":   HalalStatus.COMPLIANT,
-            "haram":       HalalStatus.NON_COMPLIANT,
-            "non_compliant": HalalStatus.NON_COMPLIANT,
-            "not_halal":   HalalStatus.NON_COMPLIANT,
-            "questionable": HalalStatus.DOUBTFUL,
-            "doubtful":    HalalStatus.DOUBTFUL,
+            "COMPLIANT":     HalalStatus.COMPLIANT,
+            "HALAL":         HalalStatus.COMPLIANT,
+            "NON_COMPLIANT": HalalStatus.NON_COMPLIANT,
+            "NOT_HALAL":     HalalStatus.NON_COMPLIANT,
+            "HARAM":         HalalStatus.NON_COMPLIANT,
+            "QUESTIONABLE":  HalalStatus.DOUBTFUL,
+            "DOUBTFUL":      HalalStatus.DOUBTFUL,
+            "UNKNOWN":       HalalStatus.UNKNOWN,
         }
         status = status_map.get(raw_status, HalalStatus.UNKNOWN)
 
-        # Try to extract sector from business screen
-        activities = (
-            compliance.get("businessScreen", {}).get("activities", []) or []
-        )
-        sector = activities[0].get("name", "") if activities else ""
+        return {
+            "status":  status,
+            "sector":  report.get("exchange", ""),
+            "raw":     report,
+        }
 
-        return {"status": status, "sector": sector, "raw": compliance}
-
-    except httpx.HTTPError as e:
-        logger.error(f"Zoya API error for {symbol}: {e}")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Zoya HTTP error for {symbol}: {e} — {e.response.text[:200]}")
         return {"status": HalalStatus.UNKNOWN, "sector": "", "raw": {}}
     except Exception as e:
         logger.error(f"Unexpected Zoya error for {symbol}: {e}")
         return {"status": HalalStatus.UNKNOWN, "sector": "", "raw": {}}
 
 
-# ── Layer 2: Finnhub + Claude ratio check ─────────────────────────────────────
+# ── Layer 2: Finnhub + Claude ratio check ──────────────────────────────────────
 
 def _finnhub_financials(symbol: str) -> dict:
     """
     Fetch company profile and key financial metrics from Finnhub.
-
-    Returns raw dict combining profile + metric data.
+    Handles redirects and non-JSON responses gracefully.
     """
     results = {}
     endpoints = {
-        "profile":  f"/stock/profile2?symbol={symbol}",
-        "metrics":  f"/stock/metric?symbol={symbol}&metric=all",
-        "financials": f"/financials-reported?symbol={symbol}&freq=annual&limit=1",
+        "profile": f"/stock/profile2?symbol={symbol}",
+        "metrics": f"/stock/metric?symbol={symbol}&metric=all",
     }
     headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
 
-    with httpx.Client(base_url=FINNHUB_BASE_URL, timeout=10, follow_redirects=True) as client:
+    with httpx.Client(
+        base_url=FINNHUB_BASE_URL,
+        timeout=10,
+        follow_redirects=True,
+    ) as client:
         for key, path in endpoints.items():
             try:
                 resp = client.get(path, headers=headers)
                 resp.raise_for_status()
+                # Guard against empty or non-JSON responses
+                content = resp.text.strip()
+                if not content or content.startswith("<"):
+                    logger.warning(f"Finnhub {key} for {symbol}: non-JSON response, skipping")
+                    results[key] = {}
+                    continue
                 results[key] = resp.json()
-            except httpx.HTTPError as e:
+            except httpx.HTTPStatusError as e:
+                logger.warning(f"Finnhub {key} HTTP error for {symbol}: {e}")
+                results[key] = {}
+            except Exception as e:
                 logger.warning(f"Finnhub {key} error for {symbol}: {e}")
                 results[key] = {}
 
@@ -129,26 +159,24 @@ def _ratio_screen(symbol: str, company_name: str) -> dict:
     if not financials.get("profile"):
         logger.warning(f"No Finnhub profile for {symbol} — skipping ratio check")
         return {
-            "debt_ratio": None,
+            "debt_ratio":          None,
             "interest_income_pct": None,
-            "haram_revenue_pct": None,
-            "ratio_pass": None,
-            "notes": "Finnhub data unavailable.",
+            "haram_revenue_pct":   None,
+            "ratio_pass":          None,
+            "notes":               "Finnhub data unavailable — ratio check skipped.",
         }
-
     return claude_module.check_financial_ratios(symbol, company_name, financials)
 
 
 # ── Cache helpers ─────────────────────────────────────────────────────────────
 
 def _get_cached(symbol: str, db: Session) -> Optional[HalalScreenResult]:
-    """Return a non-expired cached screen result, or None."""
     now = datetime.now(timezone.utc)
     return (
         db.query(HalalScreenResult)
         .filter(
-            HalalScreenResult.symbol == symbol,
-            HalalScreenResult.expires_at > now,
+            HalalScreenResult.symbol     == symbol,
+            HalalScreenResult.expires_at >  now,
         )
         .order_by(HalalScreenResult.screened_at.desc())
         .first()
@@ -156,7 +184,6 @@ def _get_cached(symbol: str, db: Session) -> Optional[HalalScreenResult]:
 
 
 def _save_result(result: dict, db: Session) -> HalalScreenResult:
-    """Persist a new screening result to the cache table."""
     record = HalalScreenResult(
         symbol              = result["symbol"],
         zoya_status         = result["zoya_status"],
@@ -180,22 +207,7 @@ def _save_result(result: dict, db: Session) -> HalalScreenResult:
 def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
     """
     Run the full two-layer halal screen for a symbol.
-
-    Returns:
-        {
-            "symbol": "AAPL",
-            "zoya_status": "compliant",
-            "final_status": "compliant",
-            "sector": "Technology",
-            "debt_ratio": 0.12,
-            "interest_income_pct": 0.8,
-            "haram_revenue_pct": 0.0,
-            "ratio_pass": True,
-            "notes": "Passes all AAOIFI thresholds.",
-            "from_cache": True
-        }
     """
-    # Check cache first unless force refresh requested
     if not force_refresh:
         cached = _get_cached(symbol, db)
         if cached:
@@ -216,10 +228,10 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
     logger.info(f"Running fresh halal screen for {symbol}")
 
     # ── Layer 1: Zoya ──
-    zoya = _zoya_screen(symbol)
-    zoya_status: HalalStatus = zoya["status"]
+    zoya        = _zoya_screen(symbol)
+    zoya_status = zoya["status"]
 
-    # Hard block — skip ratio check entirely if Zoya says non-compliant
+    # Hard block — skip ratio check entirely
     if zoya_status == HalalStatus.NON_COMPLIANT:
         result = {
             "symbol":              symbol,
@@ -230,29 +242,28 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
             "interest_income_pct": None,
             "haram_revenue_pct":   None,
             "ratio_pass":          None,
-            "notes":               f"Hard blocked by Zoya sector screen. Sector: {zoya.get('sector', 'unknown')}",
+            "notes":               f"Hard blocked by Zoya. Sector: {zoya.get('sector', 'unknown')}",
             "from_cache":          False,
         }
         _save_result(result, db)
         return result
 
-    # ── Layer 2: Financial ratios (only for compliant / doubtful / unknown) ──
-    # Get company name from Finnhub for Claude prompt
+    # ── Layer 2: Financial ratios ──
     try:
         profile_resp = httpx.get(
             f"{FINNHUB_BASE_URL}/stock/profile2",
             params={"symbol": symbol},
             headers={"X-Finnhub-Token": FINNHUB_API_KEY},
             timeout=5,
+            follow_redirects=True,
         )
-        company_name = profile_resp.json().get("name", symbol)
+        company_name = profile_resp.json().get("name", symbol) if profile_resp.is_success else symbol
     except Exception:
         company_name = symbol
 
-    ratios = _ratio_screen(symbol, company_name)
+    ratios     = _ratio_screen(symbol, company_name)
     ratio_pass = ratios.get("ratio_pass")
 
-    # Determine final combined verdict
     if zoya_status == HalalStatus.COMPLIANT and ratio_pass is True:
         final_status = HalalStatus.COMPLIANT
     elif zoya_status == HalalStatus.NON_COMPLIANT or ratio_pass is False:
@@ -279,14 +290,10 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
 
 
 def screen_watchlist(symbols: list[str], db: Session) -> list[dict]:
-    """
-    Screen a list of symbols. Returns results for all, even failures.
-    """
     results = []
     for symbol in symbols:
         try:
-            result = screen_stock(symbol, db)
-            results.append(result)
+            results.append(screen_stock(symbol, db))
         except Exception as e:
             logger.error(f"Failed to screen {symbol}: {e}")
             results.append({
