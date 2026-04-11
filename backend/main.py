@@ -459,3 +459,15 @@ def _get_default_user_id(db: Session):
             detail="No user found. Please complete onboarding.",
         )
     return user.id
+
+@app.delete("/api/screen/cache/{symbol}", tags=["halal"])
+def clear_halal_cache(symbol: str, db: Session = Depends(get_db)):
+    """Delete cached halal screen result for a symbol — forces fresh screen next call."""
+    from datetime import timezone
+    deleted = (
+        db.query(HalalScreenResult)
+        .filter(HalalScreenResult.symbol == symbol.upper())
+        .delete()
+    )
+    db.commit()
+    return {"message": f"Cleared {deleted} cache entries for {symbol.upper()}"}

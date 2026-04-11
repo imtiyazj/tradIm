@@ -101,6 +101,7 @@ Return a JSON object with exactly these keys:
   ]
 }}"""
 
+    fallback = {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
     try:
         response = get_client().messages.create(
             model=MODEL,
@@ -109,14 +110,26 @@ Return a JSON object with exactly these keys:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
+
+        if not raw:
+            logger.warning("Claude returned empty response in analyse_stocks")
+            return fallback
+
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(
+                line for line in lines
+                if not line.strip().startswith("```")
+            ).strip()
+
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        logger.error(f"Claude JSON parse error in analyse_stocks: {e}\nRaw: {raw}")
-        return {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
+        logger.error(f"Claude JSON parse error in analyse_stocks: {e}\nRaw: {raw!r}")
+        return fallback
     except Exception as e:
         logger.error(f"Claude API error in analyse_stocks: {e}")
-        return {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
-
+        return fallback
 
 # ── 2. Halal financial ratio check (Layer 2) ──────────────────────────────────
 
