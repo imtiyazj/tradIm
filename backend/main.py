@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from db.models import (
     get_engine, create_tables,
     WatchlistItem, Signal, DailyReport, Trade,
-    HalalStatus,
+    HalalStatus, HalalScreenResult,
 )
 import halal_screen as halal_module
 import claude as claude_module
