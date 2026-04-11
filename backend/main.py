@@ -418,6 +418,33 @@ def trigger_morning_job():
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
+# ── One-time setup ────────────────────────────────────────────────────────────
+
+class SetupRequest(BaseModel):
+    email: str
+    clerk_id: str = "local-dev-user"
+
+
+@app.post("/api/setup", tags=["system"])
+def setup_first_user(body: SetupRequest, db: Session = Depends(get_db)):
+    """
+    Create the initial user record. Run once after first deploy.
+    Remove or protect this endpoint after setup is complete.
+    """
+    from db.models import User
+    existing = db.query(User).filter(User.email == body.email).first()
+    if existing:
+        return {"message": "User already exists.", "user_id": str(existing.id)}
+
+    user = User(email=body.email, clerk_id=body.clerk_id)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {
+        "message": "User created successfully.",
+        "user_id": str(user.id),
+        "email":   user.email,
+    }
 
 def _get_default_user_id(db: Session):
     """
