@@ -108,7 +108,7 @@ def _finnhub_financials(symbol: str) -> dict:
     }
     headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
 
-    with httpx.Client(base_url=FINNHUB_BASE_URL, timeout=10) as client:
+    with httpx.Client(base_url=FINNHUB_BASE_URL, timeout=10, follow_redirects=True) as client:
         for key, path in endpoints.items():
             try:
                 resp = client.get(path, headers=headers)
