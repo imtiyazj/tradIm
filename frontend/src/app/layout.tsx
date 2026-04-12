@@ -7,11 +7,7 @@ export const metadata: Metadata = {
   description: "AI-powered Shariah-compliant stock research",
 };
 
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <ClerkProvider>
       <html lang="en">
