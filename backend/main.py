@@ -67,7 +67,38 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Halal Trader API...")
     create_tables()
     logger.info("Database tables ready.")
+
+    # Start the background scheduler (cron jobs)
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    from scheduler.jobs import morning_job, weekly_refresh_halal_cache
+
+    scheduler = BackgroundScheduler(timezone="America/New_York")
+    scheduler.add_job(
+        morning_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=8, minute=0, timezone="America/New_York"),
+        id="morning_job",
+        name="Daily morning analysis",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=300,
+    )
+    scheduler.add_job(
+        weekly_refresh_halal_cache,
+        trigger=CronTrigger(day_of_week="sun", hour=6, minute=0, timezone="America/New_York"),
+        id="halal_cache_refresh",
+        name="Weekly halal cache refresh",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    logger.info("Background scheduler started.")
+    for job in scheduler.get_jobs():
+        logger.info(f"  Scheduled: {job.name} — next run: {job.next_run_time}")
+
     yield
+
+    scheduler.shutdown(wait=False)
     logger.info("Halal Trader API shutting down.")
 
 
