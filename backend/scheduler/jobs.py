@@ -264,6 +264,20 @@ def morning_job():
         user_id = watchlist_items[0].user_id
         logger.info(f"Processing {len(symbols)} symbols: {symbols}")
 
+        # ── Check if already ran today ──
+        from datetime import date
+        today = datetime.now(timezone.utc).date()
+        existing_report = (
+            db.query(DailyReport)
+            .filter(
+                DailyReport.report_date >= datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+            )
+            .first()
+        )
+        if existing_report:
+            logger.info(f"Morning job already ran today ({today}) — skipping. Use force=True to override.")
+            return
+
         # ── 2. Fetch market data + news ──
         logger.info("Fetching market data from Polygon...")
         market_data = fetch_market_data(symbols)
@@ -332,15 +346,25 @@ def morning_job():
 
         # Save signals to DB
         for sig in signals:
-            signal_record = Signal(
-                user_id     = user_id,
-                symbol      = sig.get("symbol", ""),
-                signal_type = sig.get("type", "watch"),
-                confidence  = sig.get("confidence"),
-                reasoning   = sig.get("reasoning", ""),
-                price_at    = market_data.get(sig.get("symbol", ""), {}).get("price"),
+            already_exists = (
+                db.query(Signal)
+                .filter(
+                    Signal.symbol == sig.get("symbol", ""),
+                    Signal.triggered_at >= datetime(today.year, today.month, today.day, tzinfo=timezone.utc),
+                )
+                .first()
             )
-            db.add(signal_record)
+            if not already_exists:
+                signal_record = Signal(
+                    user_id     = user_id,
+                    symbol      = sig.get("symbol", ""),
+                    signal_type = sig.get("type", "watch"),
+                    confidence  = sig.get("confidence"),
+                    reasoning   = sig.get("reasoning", ""),
+                    price_at    = market_data.get(sig.get("symbol", ""), {}).get("price"),
+                )
+                db.add(signal_record)
+
         db.commit()
         logger.info(f"Saved {len(signals)} signals to database")
 

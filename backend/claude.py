@@ -101,7 +101,6 @@ Return a JSON object with exactly these keys:
   ]
 }}"""
 
-    fallback = {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
     try:
         response = get_client().messages.create(
             model=MODEL,
@@ -110,26 +109,14 @@ Return a JSON object with exactly these keys:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-
-        if not raw:
-            logger.warning("Claude returned empty response in analyse_stocks")
-            return fallback
-
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            raw = "\n".join(
-                line for line in lines
-                if not line.strip().startswith("```")
-            ).strip()
-
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        logger.error(f"Claude JSON parse error in analyse_stocks: {e}\nRaw: {raw!r}")
-        return fallback
+        logger.error(f"Claude JSON parse error in analyse_stocks: {e}\nRaw: {raw}")
+        return {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
     except Exception as e:
         logger.error(f"Claude API error in analyse_stocks: {e}")
-        return fallback
+        return {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
+
 
 # ── 2. Halal financial ratio check (Layer 2) ──────────────────────────────────
 
@@ -376,3 +363,114 @@ Return ONLY the summary text."""
     except Exception as e:
         logger.error(f"Claude API error in generate_daily_summary: {e}")
         return "Daily summary unavailable."
+
+
+# ── 6. Discovery analysis ─────────────────────────────────────────────────────
+
+def analyse_discovery(
+    candidates: list[dict],
+    market_data: dict,
+    news_by_symbol: dict,
+    top_n: int = 10,
+) -> dict:
+    """
+    Rank and analyse halal-compliant stock candidates for discovery.
+
+    Args:
+        candidates:      [{"symbol": "NVDA", "momentum": 0.8, "debt_ratio": 0.04, ...}]
+        market_data:     {"NVDA": {"price": 188, "change_pct": 2.3, "volume": 159M}, ...}
+        news_by_symbol:  {"NVDA": [{"headline": "...", "sentiment": "positive"}], ...}
+        top_n:           How many top picks to return
+
+    Returns:
+        {
+            "picks": [
+                {
+                    "symbol": "NVDA",
+                    "signal": "buy|watch|avoid",
+                    "confidence": 0.82,
+                    "reasoning": "...",
+                    "price": 188.63,
+                    "change_pct": 2.34,
+                    "catalysts": ["AI infrastructure demand", "CoreWeave deals"],
+                    "risks": ["Extended valuation", "Macro uncertainty"],
+                    "suggested_action": "Consider initiating a position on any pullback to $184-185",
+                }
+            ],
+            "summary": "Plain-English overview of today's discovery results"
+        }
+    """
+    fallback = {"picks": [], "summary": "Discovery analysis unavailable."}
+
+    prompt = f"""You are analysing a universe of Shariah-compliant stocks to find the best
+passive investment opportunities for an H-1B visa holder today.
+
+CANDIDATE STOCKS (halal-screened, sorted by momentum score):
+{json.dumps(candidates[:20], indent=2)}
+
+MARKET DATA (price, % change, volume):
+{json.dumps(market_data, indent=2)}
+
+RECENT NEWS BY SYMBOL:
+{json.dumps(news_by_symbol, indent=2)}
+
+Your task:
+1. Identify the top {top_n} opportunities from this universe
+2. Rank by: momentum + news sentiment + halal ratio quality + long-term potential
+3. For each pick explain WHY it's interesting today
+4. Flag specific catalysts (what's driving it) and risks
+5. Suggest a passive-investor-friendly action (not day trading)
+
+IMPORTANT constraints:
+- This is for PASSIVE long-term investing only (H-1B visa)
+- Prefer stocks with strong fundamentals, not just momentum
+- Favour quality halal ratios (low debt, no interest income)
+- No options, no leverage, no short selling suggestions
+
+Return ONLY a JSON object:
+{{
+  "picks": [
+    {{
+      "symbol": "TICKER",
+      "signal": "buy|watch|avoid",
+      "confidence": 0.0-1.0,
+      "reasoning": "2-3 sentence explanation of why this is interesting today",
+      "price": <number>,
+      "change_pct": <number>,
+      "catalysts": ["catalyst 1", "catalyst 2"],
+      "risks": ["risk 1", "risk 2"],
+      "suggested_action": "One sentence passive investing suggestion"
+    }}
+  ],
+  "summary": "3-4 sentence plain-English overview of today's best halal opportunities"
+}}"""
+
+    try:
+        response = get_client().messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+
+        if not raw:
+            logger.warning("Claude returned empty response in analyse_discovery")
+            return fallback
+
+        # Strip markdown fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            raw = "\n".join(
+                line for line in lines
+                if not line.strip().startswith("```")
+            ).strip()
+
+        return json.loads(raw)
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Claude JSON parse error in analyse_discovery: {e}\nRaw: {raw!r}")
+        return fallback
+    except Exception as e:
+        logger.error(f"Claude API error in analyse_discovery: {e}")
+        return fallback

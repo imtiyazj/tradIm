@@ -1,39 +1,29 @@
 """
 main.py — FastAPI backend entry point.
-
-Routes:
-  GET  /health                    — health check
-  GET  /api/watchlist             — list watchlist
-  POST /api/watchlist             — add symbol
-  DELETE /api/watchlist/{symbol}  — remove symbol
-  GET  /api/screen/{symbol}       — halal screen result
-  GET  /api/signals               — today's signals
-  GET  /api/portfolio             — current Alpaca positions
-  GET  /api/reports               — daily reports
-  GET  /api/reports/{date}        — specific day's report
-  POST /api/scheduler/run         — manually trigger morning job
-  GET  /api/tax/summary           — tax summary for a year
 """
+
 import sys
 import os
+
+# Ensure the app root is always on the Python path
+# This fixes Railway's module resolution regardless of how uvicorn is invoked
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from typing import Optional
 
 import requests
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session, sessionmaker
 
 from db.models import (
     get_engine, create_tables,
     WatchlistItem, Signal, DailyReport, Trade,
-    HalalStatus, HalalScreenResult,
+    HalalStatus,
 )
 import halal_screen as halal_module
 import claude as claude_module
@@ -52,7 +42,7 @@ ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.ma
 
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
-    "http://localhost:3000"   # overridden in Railway via env var
+    "http://localhost:3000"
 ).split(",")
 
 
@@ -74,7 +64,6 @@ def get_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Run on startup — ensure tables exist."""
     logger.info("Starting Halal Trader API...")
     create_tables()
     logger.info("Database tables ready.")
@@ -89,11 +78,10 @@ app = FastAPI(
     version="0.1.0",
     description="AI-powered halal stock research and passive trading backend.",
     lifespan=lifespan,
-    docs_url="/docs",   # disable in production: docs_url=None
+    docs_url="/docs",
     redoc_url=None,
 )
 
-# CORS — locked to your frontend domain
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -103,7 +91,7 @@ app.add_middleware(
 )
 
 
-# ── Pydantic schemas ─────────────────────────────────────────────────────────
+# ── Pydantic schemas ──────────────────────────────────────────────────────────
 
 class WatchlistAddRequest(BaseModel):
     symbol: str
@@ -121,22 +109,10 @@ class HealthResponse(BaseModel):
     alpaca_mode: str
 
 
-# ── Auth placeholder ─────────────────────────────────────────────────────────
-# TODO: Replace with Clerk JWT verification middleware
-# For now, a simple API key check gates all /api/ routes
-
-def verify_api_key(
-    # In production this will be: token: str = Depends(clerk_auth)
-    # For now just accept all requests from the same-origin frontend
-):
-    pass  # Replace with real auth before going live
-
-
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health", response_model=HealthResponse, tags=["system"])
 def health_check():
-    """Healthcheck endpoint — used by Railway to verify the service is up."""
     return {
         "status":      "ok",
         "timestamp":   datetime.now(timezone.utc).isoformat(),
@@ -148,7 +124,6 @@ def health_check():
 
 @app.get("/api/watchlist", tags=["watchlist"])
 def get_watchlist(db: Session = Depends(get_db)):
-    """Return all active watchlist items."""
     items = db.query(WatchlistItem).filter(WatchlistItem.is_active == True).all()
     return [
         {
@@ -166,12 +141,10 @@ def add_to_watchlist(
     body: WatchlistAddRequest,
     db:   Session = Depends(get_db),
 ):
-    """Add a symbol to the watchlist and run an immediate halal screen."""
-    # Check for duplicate
     existing = (
         db.query(WatchlistItem)
         .filter(
-            WatchlistItem.symbol == body.symbol,
+            WatchlistItem.symbol    == body.symbol,
             WatchlistItem.is_active == True,
         )
         .first()
@@ -182,20 +155,17 @@ def add_to_watchlist(
             detail=f"{body.symbol} is already on your watchlist.",
         )
 
-    # Run halal screen before adding
     screen = halal_module.screen_stock(body.symbol, db)
     if screen["final_status"] == HalalStatus.NON_COMPLIANT:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"{body.symbol} is not Shariah-compliant and cannot be added. "
+            detail=f"{body.symbol} is not Shariah-compliant. "
                    f"Reason: {screen.get('notes', 'Non-compliant per Zoya screen')}",
         )
 
     item = WatchlistItem(
         symbol  = body.symbol,
         notes   = body.notes,
-        # user_id will come from Clerk JWT once auth is wired
-        # hard-coded temporarily for single-user setup
         user_id = _get_default_user_id(db),
     )
     db.add(item)
@@ -213,11 +183,10 @@ def add_to_watchlist(
 
 @app.delete("/api/watchlist/{symbol}", tags=["watchlist"])
 def remove_from_watchlist(symbol: str, db: Session = Depends(get_db)):
-    """Soft-delete a symbol from the watchlist."""
     item = (
         db.query(WatchlistItem)
         .filter(
-            WatchlistItem.symbol   == symbol.upper(),
+            WatchlistItem.symbol    == symbol.upper(),
             WatchlistItem.is_active == True,
         )
         .first()
@@ -237,19 +206,13 @@ def screen_symbol(
     force_refresh: bool = False,
     db:            Session = Depends(get_db),
 ):
-    """Run (or return cached) halal screen for a symbol."""
-    result = halal_module.screen_stock(symbol.upper(), db, force_refresh=force_refresh)
-    return result
+    return halal_module.screen_stock(symbol.upper(), db, force_refresh=force_refresh)
 
 
 # ── Signals ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/signals", tags=["signals"])
-def get_signals(
-    days: int = 7,
-    db:   Session = Depends(get_db),
-):
-    """Return Claude-generated signals from the last N days."""
+def get_signals(days: int = 7, db: Session = Depends(get_db)):
     from datetime import timedelta
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     signals = (
@@ -278,7 +241,6 @@ def get_signals(
 
 @app.get("/api/portfolio", tags=["portfolio"])
 def get_portfolio():
-    """Return current Alpaca positions."""
     try:
         resp = requests.get(
             f"{ALPACA_BASE_URL}/v2/positions",
@@ -289,10 +251,9 @@ def get_portfolio():
             timeout=10,
         )
         resp.raise_for_status()
-        positions = resp.json()
         return {
-            "positions":  positions,
-            "count":      len(positions),
+            "positions":   resp.json(),
+            "count":       len(resp.json()),
             "alpaca_mode": "paper" if "paper" in ALPACA_BASE_URL else "live",
         }
     except Exception as e:
@@ -304,7 +265,6 @@ def get_portfolio():
 
 @app.get("/api/reports", tags=["reports"])
 def list_reports(limit: int = 30, db: Session = Depends(get_db)):
-    """Return the most recent daily reports."""
     reports = (
         db.query(DailyReport)
         .order_by(DailyReport.report_date.desc())
@@ -316,12 +276,10 @@ def list_reports(limit: int = 30, db: Session = Depends(get_db)):
 
 @app.get("/api/reports/{report_date}", tags=["reports"])
 def get_report(report_date: str, db: Session = Depends(get_db)):
-    """Return a specific day's report by date (YYYY-MM-DD)."""
     try:
         target = datetime.strptime(report_date, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD format.")
-
     report = (
         db.query(DailyReport)
         .filter(DailyReport.report_date >= datetime(target.year, target.month, target.day))
@@ -335,39 +293,29 @@ def get_report(report_date: str, db: Session = Depends(get_db)):
 
 def _report_to_dict(r: DailyReport) -> dict:
     return {
-        "id":               str(r.id),
-        "report_date":      r.report_date.strftime("%Y-%m-%d"),
-        "stocks_screened":  r.stocks_screened,
-        "halal_passed":     r.halal_passed,
-        "signals_fired":    r.signals_fired,
-        "trades_executed":  r.trades_executed,
-        "alerts_sent":      r.alerts_sent,
-        "summary":          r.summary,
+        "id":              str(r.id),
+        "report_date":     r.report_date.strftime("%Y-%m-%d"),
+        "stocks_screened": r.stocks_screened,
+        "halal_passed":    r.halal_passed,
+        "signals_fired":   r.signals_fired,
+        "trades_executed": r.trades_executed,
+        "alerts_sent":     r.alerts_sent,
+        "summary":         r.summary,
     }
 
 
 # ── Tax ───────────────────────────────────────────────────────────────────────
 
 @app.get("/api/tax/summary", tags=["tax"])
-def get_tax_summary(
-    year: int = datetime.now().year,
-    db:   Session = Depends(get_db),
-):
-    """Generate a tax summary for the given year using Claude."""
-    # Fetch closed trades for the year
+def get_tax_summary(year: int = datetime.now().year, db: Session = Depends(get_db)):
     year_start = datetime(year, 1, 1, tzinfo=timezone.utc)
     year_end   = datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
-
     trades = (
         db.query(Trade)
-        .filter(
-            Trade.traded_at >= year_start,
-            Trade.traded_at <= year_end,
-        )
+        .filter(Trade.traded_at >= year_start, Trade.traded_at <= year_end)
         .order_by(Trade.traded_at)
         .all()
     )
-
     trades_data = [
         {
             "symbol":      t.symbol,
@@ -379,8 +327,6 @@ def get_tax_summary(
         }
         for t in trades
     ]
-
-    # Current positions as potential harvesting opportunities
     try:
         resp = requests.get(
             f"{ALPACA_BASE_URL}/v2/positions",
@@ -402,55 +348,73 @@ def get_tax_summary(
 
 @app.post("/api/scheduler/run", tags=["system"])
 def trigger_morning_job():
-    """
-    Manually trigger the morning job — useful for testing.
-    Protected: only call from dashboard, never expose publicly.
-    """
     import threading
     from scheduler.jobs import morning_job
 
-    def run_in_thread():
-        morning_job()
-
-    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread = threading.Thread(target=morning_job, daemon=True)
     thread.start()
-    return {"message": "Morning job triggered in background. Check Telegram for updates."}
+    return {"message": "Morning job triggered. Check Telegram for updates."}
+
+
+# ── Discovery ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/discover", tags=["discovery"])
+def discover_stocks(
+    top_n:     int  = 10,
+    min_price: float = 10.0,
+    db:        Session = Depends(get_db),
+):
+    """
+    Run the halal stock discovery engine.
+    Scans ~100 pre-screened halal-friendly stocks, ranks by momentum + Claude analysis.
+    Results are cached for 1 hour to avoid excessive API costs.
+    """
+    import redis as redis_lib
+    import json as json_lib
+
+    REDIS_URL = os.environ.get("REDIS_URL", "")
+    cache_key = f"discovery:top{top_n}:min{min_price}"
+
+    # Try cache first (1 hour TTL)
+    if REDIS_URL:
+        try:
+            r = redis_lib.from_url(REDIS_URL)
+            cached = r.get(cache_key)
+            if cached:
+                logger.info("Discovery cache hit")
+                return json_lib.loads(cached)
+        except Exception as e:
+            logger.warning(f"Redis cache miss: {e}")
+
+    # Run fresh discovery
+    import discovery as discovery_module
+    result = discovery_module.run_discovery(db=db, top_n=top_n, min_price=min_price)
+
+    # Cache for 1 hour
+    if REDIS_URL:
+        try:
+            r = redis_lib.from_url(REDIS_URL)
+            r.setex(cache_key, 3600, json_lib.dumps(result, default=str))
+        except Exception as e:
+            logger.warning(f"Redis cache set failed: {e}")
+
+    return result
+
+
+@app.post("/api/discover/refresh", tags=["discovery"])
+def refresh_discovery(
+    top_n:     int   = 10,
+    min_price: float = 10.0,
+    db:        Session = Depends(get_db),
+):
+    """Force refresh discovery — bypasses cache."""
+    import discovery as discovery_module
+    return discovery_module.run_discovery(db=db, top_n=top_n, min_price=min_price)
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
-# ── One-time setup ────────────────────────────────────────────────────────────
-
-class SetupRequest(BaseModel):
-    email: str
-    clerk_id: str = "local-dev-user"
-
-
-@app.post("/api/setup", tags=["system"])
-def setup_first_user(body: SetupRequest, db: Session = Depends(get_db)):
-    """
-    Create the initial user record. Run once after first deploy.
-    Remove or protect this endpoint after setup is complete.
-    """
-    from db.models import User
-    existing = db.query(User).filter(User.email == body.email).first()
-    if existing:
-        return {"message": "User already exists.", "user_id": str(existing.id)}
-
-    user = User(email=body.email, clerk_id=body.clerk_id)
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return {
-        "message": "User created successfully.",
-        "user_id": str(user.id),
-        "email":   user.email,
-    }
 
 def _get_default_user_id(db: Session):
-    """
-    Return the first user's ID.
-    Replace with Clerk JWT extraction once auth middleware is in place.
-    """
     from db.models import User
     user = db.query(User).first()
     if not user:
@@ -459,15 +423,3 @@ def _get_default_user_id(db: Session):
             detail="No user found. Please complete onboarding.",
         )
     return user.id
-
-@app.delete("/api/screen/cache/{symbol}", tags=["halal"])
-def clear_halal_cache(symbol: str, db: Session = Depends(get_db)):
-    """Delete cached halal screen result for a symbol — forces fresh screen next call."""
-    from datetime import timezone
-    deleted = (
-        db.query(HalalScreenResult)
-        .filter(HalalScreenResult.symbol == symbol.upper())
-        .delete()
-    )
-    db.commit()
-    return {"message": f"Cleared {deleted} cache entries for {symbol.upper()}"}
