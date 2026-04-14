@@ -11,11 +11,41 @@ Handles all Claude calls:
 
 import os
 import json
+import re
 import logging
 from typing import Optional
 import anthropic
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_json(raw: str) -> dict:
+    """
+    Parse JSON from a Claude response that may be wrapped in markdown code fences.
+    Tries direct parse first, then strips fences, then extracts the first {...} block.
+    """
+    text = raw.strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strip markdown code fences: ```json ... ``` or ``` ... ```
+    stripped = re.sub(r"^```(?:json)?\s*", "", text)
+    stripped = re.sub(r"\s*```$", "", stripped).strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: extract the first { ... } block
+    match = re.search(r"\{[\s\S]*\}", stripped)
+    if match:
+        return json.loads(match.group())
+
+    raise json.JSONDecodeError("No valid JSON found in Claude response", text, 0)
 
 # ── Client ────────────────────────────────────────────────────────────────────
 
@@ -109,7 +139,7 @@ Return a JSON object with exactly these keys:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        return json.loads(raw)
+        return _parse_json(raw)
     except json.JSONDecodeError as e:
         logger.error(f"Claude JSON parse error in analyse_stocks: {e}\nRaw: {raw}")
         return {"signals": [], "summary": "Analysis unavailable today.", "tax_flags": []}
@@ -193,7 +223,7 @@ Return ONLY a JSON object:
                 if not line.strip().startswith("```")
             ).strip()
 
-        return json.loads(raw)
+        return _parse_json(raw)
 
     except json.JSONDecodeError as e:
         logger.error(f"Claude JSON parse error in check_financial_ratios: {e}\nRaw: {raw!r}")
@@ -274,7 +304,7 @@ Return ONLY a JSON object:
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        return json.loads(raw)
+        return _parse_json(raw)
     except Exception as e:
         logger.error(f"Claude API error in generate_tax_summary: {e}")
         return {"error": str(e), "notes": "Tax summary unavailable."}
@@ -466,7 +496,7 @@ Return ONLY a JSON object:
                 if not line.strip().startswith("```")
             ).strip()
 
-        return json.loads(raw)
+        return _parse_json(raw)
 
     except json.JSONDecodeError as e:
         logger.error(f"Claude JSON parse error in analyse_discovery: {e}\nRaw: {raw!r}")
