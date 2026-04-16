@@ -61,6 +61,7 @@ def get_client() -> anthropic.Anthropic:
 
 MODEL = "claude-sonnet-4-5"
 MAX_TOKENS = 2048
+MAX_TOKENS_DISCOVERY = 4096   # Discovery returns 10+ picks — needs more headroom
 
 
 # ── Shared system prompt ──────────────────────────────────────────────────────
@@ -478,7 +479,7 @@ Return ONLY a JSON object:
     try:
         response = get_client().messages.create(
             model=MODEL,
-            max_tokens=MAX_TOKENS,
+            max_tokens=MAX_TOKENS_DISCOVERY,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": prompt}],
         )

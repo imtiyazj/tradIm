@@ -77,13 +77,20 @@ def _fetch_snapshot(symbols: list[str]) -> dict:
             sym = item.get("ticker", "")
             day = item.get("day", {})
             prev = item.get("prevDay", {})
+            # Price cascade: last trade → today's close → prev day close
+            # prevDay.c is always populated so this handles pre-market, after-hours, weekends
+            price = (
+                item.get("lastTrade", {}).get("p")
+                or day.get("c")
+                or prev.get("c", 0)
+            )
             results[sym] = {
-                "price":       item.get("lastTrade", {}).get("p") or day.get("c", 0),
+                "price":       price,
                 "change_pct":  item.get("todaysChangePerc", 0),
-                "volume":      day.get("v", 0),
-                "avg_volume":  item.get("prevDay", {}).get("v", 0),
-                "high":        day.get("h", 0),
-                "low":         day.get("l", 0),
+                "volume":      day.get("v", 0) or prev.get("v", 0),
+                "avg_volume":  prev.get("v", 0),
+                "high":        day.get("h", 0) or prev.get("h", 0),
+                "low":         day.get("l", 0) or prev.get("l", 0),
                 "prev_close":  prev.get("c", 0),
             }
     except Exception as e:

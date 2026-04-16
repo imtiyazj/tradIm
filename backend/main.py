@@ -443,6 +443,98 @@ def refresh_discovery(
     return discovery_module.run_discovery(db=db, top_n=top_n, min_price=min_price)
 
 
+# ── Paper trading ─────────────────────────────────────────────────────────────
+
+class TradeRequest(BaseModel):
+    symbol: str
+    qty: float
+    side: str  # "buy" | "sell"
+
+    @field_validator("symbol")
+    @classmethod
+    def symbol_upper(cls, v: str) -> str:
+        return v.upper().strip()
+
+    @field_validator("side")
+    @classmethod
+    def side_lower(cls, v: str) -> str:
+        v = v.lower()
+        if v not in ("buy", "sell"):
+            raise ValueError("side must be 'buy' or 'sell'")
+        return v
+
+    @field_validator("qty")
+    @classmethod
+    def qty_positive(cls, v: float) -> float:
+        if v <= 0:
+            raise ValueError("qty must be positive")
+        return v
+
+
+@app.post("/api/trade", tags=["trading"])
+def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
+    """
+    Place a paper (or live) market order via Alpaca.
+    Currently wired to Alpaca paper trading by default.
+    """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        raise HTTPException(status_code=503, detail="Alpaca credentials not configured")
+
+    payload = {
+        "symbol":        req.symbol,
+        "qty":           str(req.qty),
+        "side":          req.side,
+        "type":          "market",
+        "time_in_force": "day",
+    }
+    try:
+        resp = requests.post(
+            f"{ALPACA_BASE_URL}/v2/orders",
+            json=payload,
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        order = resp.json()
+        logger.info(f"Order placed: {req.side} {req.qty} {req.symbol} id={order.get('id')}")
+
+        # Log to Trade table
+        from db.models import Trade, TradeSide
+        user_id = _get_default_user_id(db)
+        trade = Trade(
+            user_id      = user_id,
+            symbol       = req.symbol,
+            side         = TradeSide.BUY if req.side == "buy" else TradeSide.SELL,
+            quantity     = req.qty,
+            price        = float(order.get("filled_avg_price") or 0),
+            total_value  = float(order.get("filled_avg_price") or 0) * req.qty,
+            halal_status = "compliant",   # assume compliant — screened before reaching here
+            is_paper     = "paper" in ALPACA_BASE_URL,
+        )
+        db.add(trade)
+        db.commit()
+
+        return {
+            "ok":       True,
+            "order_id": order.get("id"),
+            "symbol":   req.symbol,
+            "side":     req.side,
+            "qty":      req.qty,
+            "status":   order.get("status"),
+            "paper":    "paper" in ALPACA_BASE_URL,
+        }
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response else str(e)
+        logger.error(f"Alpaca order failed: {detail}")
+        raise HTTPException(status_code=502, detail=f"Alpaca error: {detail}")
+    except Exception as e:
+        logger.error(f"Trade placement error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def _get_default_user_id(db: Session):

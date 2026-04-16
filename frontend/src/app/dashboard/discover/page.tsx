@@ -13,6 +13,101 @@ interface DiscoveryPick {
   suggested_action: string;
 }
 
+interface TradeModalProps {
+  symbol: string;
+  price:  number;
+  side:   "buy" | "sell";
+  onClose: () => void;
+  showToast: (msg: string) => void;
+}
+
+function TradeModal({ symbol, price, side, onClose, showToast }: TradeModalProps) {
+  const [qty, setQty]         = useState("1");
+  const [loading, setLoading] = useState(false);
+
+  const total = (parseFloat(qty) || 0) * price;
+
+  const submit = async () => {
+    const parsedQty = parseFloat(qty);
+    if (!parsedQty || parsedQty <= 0) { showToast("Enter a valid quantity"); return; }
+    setLoading(true);
+    try {
+      const res = await fetch(`${API_URL}/api/trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol, qty: parsedQty, side }),
+      });
+      const data = await res.json();
+      if (!res.ok) { showToast(data.detail || "Order failed"); return; }
+      showToast(`✓ Paper ${side.toUpperCase()} ${parsedQty} ${symbol} submitted (order ${data.order_id?.slice(0,8)}…)`);
+      onClose();
+    } catch {
+      showToast("Order failed — check backend logs");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{
+      position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+    }} onClick={onClose}>
+      <div style={{
+        background: "var(--bg2)", border: "1px solid var(--border2)",
+        borderRadius: "var(--radius)", padding: 28, minWidth: 340, maxWidth: 420,
+      }} onClick={e => e.stopPropagation()}>
+        <div style={{ fontFamily: "var(--mono)", fontWeight: 600, fontSize: 16, marginBottom: 4 }}>
+          {side === "buy" ? "📈" : "📉"} Paper {side.toUpperCase()} — {symbol}
+        </div>
+        <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 20 }}>
+          This places a market order on Alpaca paper trading. No real money involved.
+        </div>
+
+        <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 6 }}>
+          Shares
+        </label>
+        <input
+          type="number"
+          min="0.001"
+          step="1"
+          value={qty}
+          onChange={e => setQty(e.target.value)}
+          style={{
+            width: "100%", padding: "8px 12px", background: "var(--bg3)",
+            border: "1px solid var(--border2)", borderRadius: "var(--radius)",
+            color: "var(--text)", fontFamily: "var(--mono)", fontSize: 14,
+            boxSizing: "border-box", marginBottom: 12,
+          }}
+          autoFocus
+        />
+
+        <div style={{
+          display: "flex", justifyContent: "space-between",
+          fontSize: 12, color: "var(--text3)", marginBottom: 20,
+        }}>
+          <span>Price: <strong style={{ color: "var(--text)" }}>${price.toFixed(2)}</strong></span>
+          <span>Est. total: <strong style={{ color: "var(--text)" }}>${total.toFixed(2)}</strong></span>
+        </div>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="btn btn-ghost" onClick={onClose} style={{ flex: 1 }} disabled={loading}>
+            Cancel
+          </button>
+          <button
+            className={`btn ${side === "buy" ? "btn-primary" : ""}`}
+            style={{ flex: 1, background: side === "sell" ? "var(--red)" : undefined }}
+            onClick={submit}
+            disabled={loading}
+          >
+            {loading ? "Placing…" : `${side === "buy" ? "Buy" : "Sell"} (Paper)`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface DiscoveryResult {
   top_picks: DiscoveryPick[];
   summary:   string;
@@ -29,6 +124,7 @@ export default function DiscoverPage() {
   const [loaded, setLoaded]   = useState(false);
   const [topN, setTopN]       = useState(10);
   const [toast, setToast]     = useState("");
+  const [tradeModal, setTradeModal] = useState<{ symbol: string; price: number; side: "buy"|"sell" } | null>(null);
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
 
@@ -276,6 +372,13 @@ export default function DiscoverPage() {
                       >
                         + Watchlist
                       </button>
+                      <button
+                        className="btn btn-primary"
+                        style={{ marginTop: 8, fontSize: 11, padding: "5px 10px", display: "block", width: "100%" }}
+                        onClick={() => setTradeModal({ symbol: pick.symbol, price: pick.price || 0, side: "buy" })}
+                      >
+                        Buy (Paper)
+                      </button>
                     </div>
                   </div>
                 </div>
@@ -286,6 +389,16 @@ export default function DiscoverPage() {
       )}
 
       {toast && <div className="toast">{toast}</div>}
+
+      {tradeModal && (
+        <TradeModal
+          symbol={tradeModal.symbol}
+          price={tradeModal.price}
+          side={tradeModal.side}
+          onClose={() => setTradeModal(null)}
+          showToast={showToast}
+        />
+      )}
     </div>
   );
 }
