@@ -21,7 +21,9 @@ import httpx
 logger = logging.getLogger(__name__)
 
 POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
-FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
+FINNHUB_API_KEY  = os.environ.get("FINNHUB_API_KEY", "")
+ALPACA_KEY       = os.environ.get("ALPACA_KEY", "")
+ALPACA_SECRET    = os.environ.get("ALPACA_SECRET", "")
 
 # ── Halal universe ────────────────────────────────────────────────────────────
 # Sourced from SPUS + HLAL ETF holdings + curated halal-friendly sectors
@@ -55,72 +57,93 @@ HALAL_UNIVERSE = [
 ]
 
 
-# ── Polygon data fetchers ─────────────────────────────────────────────────────
+# ── Market data fetchers ──────────────────────────────────────────────────────
+
+_ALPACA_HEADERS = lambda: {
+    "APCA-API-KEY-ID":     ALPACA_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET,
+}
 
 def _fetch_snapshot(symbols: list[str]) -> dict:
     """
-    Fetch market snapshot for multiple symbols from Polygon.
-    Returns dict keyed by symbol with price, volume, change data.
+    Fetch market snapshot for multiple symbols using Alpaca market data API.
+    Free with paper trading credentials. Supports up to 1000 symbols per call.
+    Falls back to Polygon per-symbol calls if Alpaca is unavailable.
     """
-    # Polygon supports up to 250 tickers in one snapshot call
-    tickers = ",".join(symbols)
     results = {}
-    try:
-        resp = httpx.get(
-            "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers",
-            params={"tickers": tickers, "apiKey": POLYGON_API_KEY},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for item in data.get("tickers", []):
-            sym = item.get("ticker", "")
-            day = item.get("day", {})
-            prev = item.get("prevDay", {})
-            # Price cascade: last trade → today's close → prev day close
-            # prevDay.c is always populated so this handles pre-market, after-hours, weekends
-            price = (
-                item.get("lastTrade", {}).get("p")
-                or day.get("c")
-                or prev.get("c", 0)
+
+    # ── Try Alpaca first (free with paper account) ──
+    if ALPACA_KEY and ALPACA_SECRET:
+        try:
+            # Alpaca accepts comma-separated symbols list
+            resp = httpx.get(
+                "https://data.alpaca.markets/v2/stocks/snapshots",
+                params={"symbols": ",".join(symbols), "feed": "iex"},
+                headers=_ALPACA_HEADERS(),
+                timeout=20,
             )
-            results[sym] = {
-                "price":       price,
-                "change_pct":  item.get("todaysChangePerc", 0),
-                "volume":      day.get("v", 0) or prev.get("v", 0),
-                "avg_volume":  prev.get("v", 0),
-                "high":        day.get("h", 0) or prev.get("h", 0),
-                "low":         day.get("l", 0) or prev.get("l", 0),
-                "prev_close":  prev.get("c", 0),
-            }
-    except Exception as e:
-        logger.error(f"Polygon snapshot fetch failed: {e}")
+            resp.raise_for_status()
+            data = resp.json()
+            for sym, snap in data.items():
+                daily  = snap.get("dailyBar") or {}
+                prev   = snap.get("prevDailyBar") or {}
+                latest = snap.get("latestTrade") or {}
+                quote  = snap.get("latestQuote") or {}
+
+                # Price cascade: latest trade → daily close → prev close → mid quote
+                price = (
+                    latest.get("p")
+                    or daily.get("c")
+                    or prev.get("c")
+                    or ((quote.get("bp", 0) + quote.get("ap", 0)) / 2) or 0
+                )
+                prev_close = prev.get("c") or 0
+                change_pct = (
+                    ((price - prev_close) / prev_close * 100)
+                    if prev_close else 0
+                )
+                results[sym] = {
+                    "price":      round(price, 4),
+                    "change_pct": round(change_pct, 2),
+                    "volume":     daily.get("v", 0) or prev.get("v", 0),
+                    "avg_volume": prev.get("v", 0),
+                    "high":       daily.get("h", 0) or prev.get("h", 0),
+                    "low":        daily.get("l", 0) or prev.get("l", 0),
+                    "prev_close": prev_close,
+                }
+            logger.info(f"Alpaca snapshot: got data for {len(results)}/{len(symbols)} symbols")
+            return results
+        except Exception as e:
+            logger.warning(f"Alpaca snapshot failed, falling back to Polygon: {e}")
+
+    # ── Fallback: Polygon per-symbol prev-day endpoint (free tier) ──
+    logger.info("Using Polygon per-symbol fallback for market data...")
+    for sym in symbols:
+        try:
+            resp = httpx.get(
+                f"https://api.polygon.io/v2/aggs/ticker/{sym}/prev",
+                params={"apiKey": POLYGON_API_KEY},
+                timeout=8,
+            )
+            if resp.is_success:
+                bars = resp.json().get("results", [])
+                if bars:
+                    bar = bars[0]
+                    results[sym] = {
+                        "price":      bar.get("c", 0),
+                        "change_pct": round(
+                            ((bar.get("c", 0) - bar.get("o", 0)) / bar.get("o", 1)) * 100, 2
+                        ),
+                        "volume":     bar.get("v", 0),
+                        "avg_volume": bar.get("v", 0),
+                        "high":       bar.get("h", 0),
+                        "low":        bar.get("l", 0),
+                        "prev_close": bar.get("c", 0),
+                    }
+        except Exception:
+            pass
+    logger.info(f"Polygon fallback: got data for {len(results)}/{len(symbols)} symbols")
     return results
-
-
-def _fetch_top_movers() -> list[dict]:
-    """
-    Fetch today's top gainers from Polygon for additional discovery.
-    """
-    movers = []
-    try:
-        resp = httpx.get(
-            "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/gainers",
-            params={"apiKey": POLYGON_API_KEY},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for item in data.get("tickers", [])[:20]:
-            movers.append({
-                "symbol":     item.get("ticker", ""),
-                "change_pct": item.get("todaysChangePerc", 0),
-                "price":      item.get("lastTrade", {}).get("p", 0),
-                "volume":     item.get("day", {}).get("v", 0),
-            })
-    except Exception as e:
-        logger.warning(f"Top movers fetch failed: {e}")
-    return movers
 
 
 def _fetch_news_batch(symbols: list[str], limit: int = 3) -> dict[str, list]:
