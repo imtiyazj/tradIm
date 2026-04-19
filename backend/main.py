@@ -504,15 +504,20 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
         # Log to Trade table
         from db.models import Trade, TradeSide
         user_id = _get_default_user_id(db)
+        # Market orders don't fill instantly — filled_avg_price is null at submission.
+        # Use submitted_at from the order response, fall back to now().
+        filled_price = float(order.get("filled_avg_price") or 0)
         trade = Trade(
-            user_id      = user_id,
-            symbol       = req.symbol,
-            side         = TradeSide.BUY if req.side == "buy" else TradeSide.SELL,
-            quantity     = req.qty,
-            price        = float(order.get("filled_avg_price") or 0),
-            total_value  = float(order.get("filled_avg_price") or 0) * req.qty,
-            halal_status = "compliant",   # assume compliant — screened before reaching here
-            is_paper     = "paper" in ALPACA_BASE_URL,
+            user_id          = user_id,
+            alpaca_order_id  = order.get("id"),
+            symbol           = req.symbol,
+            side             = TradeSide.BUY if req.side == "buy" else TradeSide.SELL,
+            quantity         = req.qty,
+            price            = filled_price,
+            total_value      = filled_price * req.qty,
+            halal_status     = "compliant",
+            is_paper         = "paper" in ALPACA_BASE_URL,
+            traded_at        = datetime.now(timezone.utc),
         )
         db.add(trade)
         db.commit()
