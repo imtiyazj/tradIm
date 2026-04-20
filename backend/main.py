@@ -240,6 +240,25 @@ def screen_symbol(
     return halal_module.screen_stock(symbol.upper(), db, force_refresh=force_refresh)
 
 
+@app.delete("/api/screen/cache", tags=["halal"])
+def clear_halal_cache(status_filter: str = "doubtful,unknown", db: Session = Depends(get_db)):
+    """
+    Delete cached halal screen results for DOUBTFUL/UNKNOWN stocks so they get re-screened.
+    Useful after fixing screening logic. Pass status_filter=all to wipe everything.
+    """
+    from db.models import HalalScreenResult
+    statuses = [s.strip().upper() for s in status_filter.split(",")]
+    query = db.query(HalalScreenResult)
+    if "ALL" not in statuses:
+        query = query.filter(
+            HalalScreenResult.final_status.in_(statuses)
+        )
+    deleted = query.delete(synchronize_session=False)
+    db.commit()
+    logger.info(f"Cleared {deleted} halal cache entries (filter: {status_filter})")
+    return {"deleted": deleted, "filter": status_filter}
+
+
 # ── Signals ───────────────────────────────────────────────────────────────────
 
 @app.get("/api/signals", tags=["signals"])

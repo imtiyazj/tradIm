@@ -32,28 +32,45 @@ ALPACA_SECRET    = os.environ.get("ALPACA_SECRET", "")
 HALAL_UNIVERSE = [
     # ── Semiconductors & AI infrastructure ──
     "NVDA", "AMD", "AVGO", "QCOM", "TSM", "AMAT", "LRCX", "KLAC", "MRVL", "ON",
+    "TXN", "ADI", "MCHP", "SWKS", "MPWR", "ENTG", "ONTO", "ACLS", "WOLF",
     # ── Software & Cloud ──
     "MSFT", "GOOGL", "ORCL", "CRM", "ADBE", "NOW", "SNOW", "DDOG", "PANW",
-    "CRWD", "NET", "ZS", "MDB", "GTLB",
+    "CRWD", "NET", "ZS", "MDB", "GTLB", "HUBS", "TEAM", "OKTA", "COUP",
+    "SPLK", "VEEV", "WDAY", "ANSS", "CDNS", "SNPS", "PTC", "PAYC", "PCTY",
+    "BILL", "FRSH", "S", "ESTC", "CFLT", "DOMO",
     # ── Hardware & Devices ──
-    "AAPL", "DELL", "HPQ", "PSTG",
+    "AAPL", "DELL", "HPQ", "PSTG", "NTAP", "WDC", "STX", "FFIV", "JNPR",
+    "ZBRA", "TRMB", "ITRI",
     # ── Healthcare & Biotech ──
     "LLY", "ABBV", "TMO", "DHR", "ISRG", "DXCM", "IDXX", "MTD", "WAT",
-    "REGN", "VRTX", "MRNA", "AMGN",
+    "REGN", "VRTX", "MRNA", "AMGN", "GILD", "BIIB", "ILMN", "IQV", "IQVIA",
+    "CRL", "MEDP", "NTRA", "EXAS", "QDEL", "HOLOGIC", "HOLX", "ALGN",
+    "STE", "WST", "PODD", "INSP", "TNDM", "IRTC",
     # ── Industrials & Engineering ──
     "CAT", "DE", "HON", "GE", "ETN", "PWR", "EMR", "ROK", "PH", "AME",
-    "CSGP", "FAST", "GWW",
+    "CSGP", "FAST", "GWW", "VRSK", "CPRT", "CTAS", "RSG", "WM", "ROP",
+    "FTV", "GNRC", "AIXA", "AXON", "TDY", "LDOS", "SAIC", "BWXT",
+    "TT", "CARR", "OTIS", "XYL", "XYLEM", "IDEX", "IEX",
     # ── Clean energy & Utilities ──
-    "NEE", "ENPH", "FSLR", "SEDG", "RUN", "BE",
+    "NEE", "ENPH", "FSLR", "SEDG", "RUN", "BE", "PLUG", "ARRY",
+    "AEE", "WEC", "CMS", "LNT", "EVRG",
     # ── Consumer & Retail (halal-compliant) ──
     "AMZN", "COST", "WMT", "TGT", "NKE", "LULU", "SBUX", "MCD", "CMG",
-    "TSLA", "F", "GM",
+    "TSLA", "F", "GM", "RIVN", "LCID", "TM", "HMC",
+    "DECK", "SKX", "CROX", "WWW", "COLM",
+    "MNST", "CELH", "KDP",
     # ── Communications & Media ──
-    "META", "NFLX", "DIS", "TTWO", "EA",
-    # ── Real estate & Infrastructure ──
+    "META", "NFLX", "DIS", "TTWO", "EA", "RBLX", "U", "UNITY",
+    "GOOGL", "GOOG", "AKAM", "FSLY", "LLNW",
+    # ── Real estate & Infrastructure (non-REIT or halal-structured) ──
     "PLD", "AMT", "EQIX", "DLR", "CCI",
     # ── Materials & Chemicals (non-haram) ──
-    "LIN", "APD", "ECL", "SHW", "NEM", "FCX",
+    "LIN", "APD", "ECL", "SHW", "NEM", "FCX", "ALB", "LTHM", "LAC",
+    "MP", "NOVT",
+    # ── E-commerce & Fintech (non-interest) ──
+    "SHOP", "SQ", "PYPL", "MELI", "SE", "GRAB", "GLBE",
+    # ── Space & Defence-adjacent (non-weapons) ──
+    "RKLB", "ASTS", "LUNR",
 ]
 
 

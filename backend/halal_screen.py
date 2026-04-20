@@ -264,11 +264,22 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
     ratios     = _ratio_screen(symbol, company_name)
     ratio_pass = ratios.get("ratio_pass")
 
-    if zoya_status == HalalStatus.COMPLIANT and ratio_pass is True:
-        final_status = HalalStatus.COMPLIANT
-    elif zoya_status == HalalStatus.NON_COMPLIANT or ratio_pass is False:
+    # Decision matrix:
+    # - Zoya COMPLIANT + ratios pass      → COMPLIANT
+    # - Zoya COMPLIANT + ratios unavailable → COMPLIANT (trust Zoya; Finnhub free tier
+    #   is unreliable and rate-limits frequently — don't penalise for missing data)
+    # - Zoya COMPLIANT + ratios fail       → NON_COMPLIANT (explicit financial violation)
+    # - Zoya NON_COMPLIANT (any ratios)    → NON_COMPLIANT (hard sector block)
+    # - Zoya DOUBTFUL                      → DOUBTFUL
+    # - Zoya UNKNOWN                       → UNKNOWN
+    if zoya_status == HalalStatus.NON_COMPLIANT:
         final_status = HalalStatus.NON_COMPLIANT
-    elif zoya_status == HalalStatus.DOUBTFUL or ratio_pass is None:
+    elif ratio_pass is False:
+        final_status = HalalStatus.NON_COMPLIANT
+    elif zoya_status == HalalStatus.COMPLIANT:
+        # Trust Zoya as authoritative — pass regardless of whether ratio data was available
+        final_status = HalalStatus.COMPLIANT
+    elif zoya_status == HalalStatus.DOUBTFUL:
         final_status = HalalStatus.DOUBTFUL
     else:
         final_status = HalalStatus.UNKNOWN
