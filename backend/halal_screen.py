@@ -26,7 +26,10 @@ FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY", "")
 ZOYA_BASE_URL    = "https://api.zoya.finance/graphql"
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
-CACHE_DAYS = 7
+CACHE_DAYS_COMPLIANT    = 7   # Re-screen compliant stocks weekly
+CACHE_DAYS_NON_COMPLIANT = 15  # Re-screen non-compliant stocks every 15 days
+CACHE_DAYS_DOUBTFUL     = 7
+CACHE_DAYS = 7  # default fallback
 
 
 # ── Layer 1: Zoya ─────────────────────────────────────────────────────────────
@@ -183,6 +186,15 @@ def _get_cached(symbol: str, db: Session) -> Optional[HalalScreenResult]:
     )
 
 
+def _cache_ttl(final_status) -> int:
+    """Return cache TTL in days based on the screening result."""
+    if final_status == HalalStatus.NON_COMPLIANT:
+        return CACHE_DAYS_NON_COMPLIANT  # 15 days — no need to re-check frequently
+    if final_status == HalalStatus.COMPLIANT:
+        return CACHE_DAYS_COMPLIANT      # 7 days — re-verify weekly
+    return CACHE_DAYS_DOUBTFUL           # 7 days for doubtful/unknown
+
+
 def _save_result(result: dict, db: Session) -> HalalScreenResult:
     record = HalalScreenResult(
         symbol              = result["symbol"],
@@ -194,7 +206,7 @@ def _save_result(result: dict, db: Session) -> HalalScreenResult:
         ratio_pass          = result.get("ratio_pass"),
         final_status        = result["final_status"],
         notes               = result.get("notes", ""),
-        expires_at          = datetime.now(timezone.utc) + timedelta(days=CACHE_DAYS),
+        expires_at          = datetime.now(timezone.utc) + timedelta(days=_cache_ttl(result["final_status"])),
     )
     db.add(record)
     db.commit()

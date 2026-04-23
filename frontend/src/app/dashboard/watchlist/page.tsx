@@ -47,6 +47,9 @@ export default function WatchlistPage() {
     return <span className={`badge ${map[status]||"badge-muted"}`}>{status.replace("_"," ")}</span>;
   };
 
+  const nonHalalItems  = items.filter(i => screens[i.symbol]?.final_status === "non_compliant");
+  const halalItems     = items.filter(i => screens[i.symbol]?.final_status !== "non_compliant");
+
   return (
     <div>
       <div className="page-header">
@@ -64,8 +67,62 @@ export default function WatchlistPage() {
         </form>
         <p style={{ fontSize:11, color:"var(--text3)", fontFamily:"var(--mono)", marginTop:8 }}>Stocks are screened via Zoya API before being added.</p>
       </div>
+      {/* Non-halal warning banner */}
+      {!loading && nonHalalItems.length > 0 && (
+        <div style={{
+          background: "var(--red-dim)", border: "1px solid var(--red)",
+          borderRadius: "var(--radius)", padding: "14px 18px", marginBottom: 16,
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+            <span style={{ fontSize: 16 }}>🚫</span>
+            <span style={{ fontWeight: 600, color: "var(--red)", fontSize: 13 }}>
+              {nonHalalItems.length} non-compliant stock{nonHalalItems.length > 1 ? "s" : ""} in your watchlist
+            </span>
+          </div>
+          <p style={{ fontSize: 12, color: "var(--text2)", marginBottom: 12, lineHeight: 1.6 }}>
+            The following stocks failed Shariah screening. They are <strong>excluded from daily analysis</strong> and
+            re-checked every 15 days. Please remove them to keep your watchlist clean.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {nonHalalItems.map(item => {
+              const s = screens[item.symbol];
+              return (
+                <div key={item.id} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  background: "var(--bg2)", borderRadius: "var(--radius)", padding: "10px 14px",
+                  border: "1px solid var(--red)",
+                }}>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                    <span style={{ fontFamily: "var(--mono)", fontWeight: 600, fontSize: 14, color: "var(--red)" }}>
+                      {item.symbol}
+                    </span>
+                    <span style={{ fontSize: 11, color: "var(--text3)" }}>
+                      {s?.notes || "Failed Shariah screening"} · re-checked every 15 days
+                    </span>
+                  </div>
+                  <button
+                    className="btn btn-danger"
+                    style={{ padding: "5px 14px", fontSize: 12 }}
+                    onClick={() => handleRemove(item.symbol)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       <div className="card">
-        <div className="card-header"><span className="card-title">Tracked stocks ({items.length})</span></div>
+        <div className="card-header">
+          <span className="card-title">Tracked stocks ({items.length})</span>
+          {!loading && nonHalalItems.length > 0 && (
+            <span style={{ fontFamily: "var(--mono)", fontSize: 11, color: "var(--text3)" }}>
+              {halalItems.length} active · {nonHalalItems.length} non-compliant
+            </span>
+          )}
+        </div>
         {loading ? (
           <div style={{ display:"flex", flexDirection:"column", gap:8 }}>{[0,1,2].map(i=><div key={i} className="skeleton" style={{ height:48 }} />)}</div>
         ) : items.length===0 ? (
@@ -74,7 +131,7 @@ export default function WatchlistPage() {
           <table className="table">
             <thead><tr><th>Symbol</th><th>Halal</th><th>Debt ratio</th><th>Notes</th><th>Added</th><th></th></tr></thead>
             <tbody>
-              {items.map(item => {
+              {halalItems.map(item => {
                 const s = screens[item.symbol];
                 return (
                   <tr key={item.id}>
@@ -82,6 +139,21 @@ export default function WatchlistPage() {
                     <td>{s ? statusBadge(s.final_status) : <span className="badge badge-muted">loading</span>}</td>
                     <td><span style={{ fontFamily:"var(--mono)", fontSize:12, color:"var(--text2)" }}>{s?.debt_ratio!=null?`${(s.debt_ratio*100).toFixed(1)}%`:"—"}</span></td>
                     <td><span style={{ fontSize:12, color:"var(--text2)" }}>{item.notes||"—"}</span></td>
+                    <td><span style={{ fontFamily:"var(--mono)", fontSize:11, color:"var(--text3)" }}>{new Date(item.added_at).toLocaleDateString()}</span></td>
+                    <td><button className="btn btn-danger" style={{ padding:"4px 10px", fontSize:11 }} onClick={()=>handleRemove(item.symbol)}>Remove</button></td>
+                  </tr>
+                );
+              })}
+              {nonHalalItems.map(item => {
+                const s = screens[item.symbol];
+                return (
+                  <tr key={item.id} style={{ opacity: 0.5 }}>
+                    <td>
+                      <span style={{ fontFamily:"var(--mono)", fontWeight:500, fontSize:14, color:"var(--red)", textDecoration:"line-through" }}>{item.symbol}</span>
+                    </td>
+                    <td>{s ? statusBadge(s.final_status) : <span className="badge badge-muted">loading</span>}</td>
+                    <td><span style={{ fontFamily:"var(--mono)", fontSize:12, color:"var(--text2)" }}>{s?.debt_ratio!=null?`${(s.debt_ratio*100).toFixed(1)}%`:"—"}</span></td>
+                    <td><span style={{ fontSize:11, color:"var(--red)" }}>⚠️ Non-compliant — remove</span></td>
                     <td><span style={{ fontFamily:"var(--mono)", fontSize:11, color:"var(--text3)" }}>{new Date(item.added_at).toLocaleDateString()}</span></td>
                     <td><button className="btn btn-danger" style={{ padding:"4px 10px", fontSize:11 }} onClick={()=>handleRemove(item.symbol)}>Remove</button></td>
                   </tr>

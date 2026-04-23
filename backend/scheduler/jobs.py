@@ -278,14 +278,9 @@ def morning_job():
             logger.info(f"Morning job already ran today ({today}) — skipping. Use force=True to override.")
             return
 
-        # ── 2. Fetch market data + news ──
-        logger.info("Fetching market data from Polygon...")
-        market_data = fetch_market_data(symbols)
-
-        logger.info("Fetching news from Finnhub...")
-        news_items = fetch_news(symbols)
-
-        # ── 3. Halal screen ──
+        # ── 2. Halal screen FIRST (uses cache — fast) ──
+        # Screen before fetching market data so we skip API calls for non-compliant stocks.
+        # Non-compliant results are cached for 15 days, so this is almost always a cache hit.
         logger.info("Running halal screening (Zoya + Claude ratios)...")
         screen_results = halal_module.screen_watchlist(symbols, db)
 
@@ -304,21 +299,41 @@ def morning_job():
             f"{len(screen_results) - len(halal_passed) - len(halal_blocked)} uncertain"
         )
 
-        # Alert if a previously watchlisted stock is now non-compliant
+        # Alert for non-compliant watchlist stocks (remind user to remove them)
         for blocked in halal_blocked:
             sym = blocked["symbol"]
-            msg = claude_module.draft_alert_message(
-                "halal_change", sym,
-                {"reason": blocked.get("notes", ""), "status": "non_compliant"}
+            msg = (
+                f"⚠️ HALAL ALERT — {sym}\n"
+                f"{sym} in your watchlist is NON-COMPLIANT.\n"
+                f"Reason: {blocked.get('notes', 'failed Shariah screening')}\n"
+                f"Action: Remove {sym} from your watchlist via the dashboard."
             )
-            sent = send_telegram(f"HALAL ALERT\n{msg}")
+            sent = send_telegram(msg)
             log_alert(
                 db, user_id,
                 AlertType.HALAL_CHANGE, AlertChannel.TELEGRAM,
                 msg, symbol=sym, sent_ok=sent
             )
 
-        # Build watchlist context for Claude (only halal-passed stocks)
+        # ── 3. Fetch market data + news ONLY for halal-compliant stocks ──
+        # Non-compliant stocks are skipped entirely — no Polygon/Finnhub calls wasted.
+        halal_symbols = [r["symbol"] for r in halal_passed]
+
+        if not halal_symbols:
+            logger.warning("No halal-compliant stocks to analyse today")
+            send_telegram(
+                "Halal Trader: No compliant stocks in watchlist today.\n"
+                f"{len(halal_blocked)} non-compliant stock(s) found — check dashboard to remove them."
+            )
+            return
+
+        logger.info(f"Fetching market data for {len(halal_symbols)} halal stocks (skipping {len(halal_blocked)} non-compliant)...")
+        market_data = fetch_market_data(halal_symbols)
+
+        logger.info("Fetching news from Finnhub...")
+        news_items = fetch_news(halal_symbols)
+
+        # Build watchlist context for Claude
         watchlist_for_claude = [
             {
                 "symbol":       r["symbol"],
@@ -328,11 +343,6 @@ def morning_job():
             }
             for r in halal_passed
         ]
-
-        if not watchlist_for_claude:
-            logger.warning("No halal-compliant stocks to analyse today")
-            send_telegram("Halal Trader: No compliant stocks found in watchlist today. Review your watchlist.")
-            return
 
         # ── 4. Claude analysis ──
         logger.info("Running Claude analysis...")
