@@ -36,10 +36,13 @@ CACHE_DAYS = 7  # default fallback
 
 def _zoya_screen(symbol: str) -> dict:
     """
-    Call Zoya GraphQL API and return compliance info.
-    Auth: pass the API key exactly as stored — Zoya expects it as-is
-    in the Authorization header (key already contains live- prefix).
+    Call Zoya GraphQL API and return compliance info including financial ratios.
+
+    Requests the full compliance breakdown so we can use Zoya's own ratio data
+    instead of relying on Finnhub for Layer 2 checks.
     """
+    # Request all available ratio fields. Zoya returns null for fields it doesn't
+    # have data on — handled gracefully below.
     query = """
     query GetCompliance($symbol: String!) {
       basicCompliance {
@@ -48,6 +51,15 @@ def _zoya_screen(symbol: str) -> dict:
           name
           exchange
           status
+          debtRatio
+          interestBearingSecuritiesRatio
+          cashAndInterestBearingSecuritiesRatio
+          revenueBreakdown {
+            halalRevenue
+            haramRevenue
+            doubtfulRevenue
+            notApplicableRevenue
+          }
         }
       }
     }
@@ -68,11 +80,15 @@ def _zoya_screen(symbol: str) -> dict:
 
         if resp.status_code == 401:
             logger.error(f"Zoya 401 — check API key. Response: {resp.text[:200]}")
-            return {"status": HalalStatus.UNKNOWN, "sector": "", "raw": {}}
+            return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
 
         resp.raise_for_status()
         data = resp.json()
-        logger.info(f"Zoya raw response for {symbol}: {data}")
+
+        # GraphQL field errors (e.g. unknown fields on basic plan) — fall back to minimal query
+        if data.get("errors"):
+            logger.warning(f"Zoya GraphQL errors for {symbol}: {data['errors']} — retrying with basic query")
+            return _zoya_screen_basic(symbol)
 
         # Navigate basicCompliance.report path
         report = (
@@ -83,7 +99,7 @@ def _zoya_screen(symbol: str) -> dict:
 
         if not report:
             logger.warning(f"Zoya returned no report for {symbol}: {data}")
-            return {"status": HalalStatus.UNKNOWN, "sector": "", "raw": data}
+            return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": data}
 
         raw_status = report.get("status", "unknown").upper()
         logger.info(f"Zoya status for {symbol}: {raw_status}")
@@ -100,11 +116,77 @@ def _zoya_screen(symbol: str) -> dict:
         }
         status = status_map.get(raw_status, HalalStatus.UNKNOWN)
 
+        # Extract ratio fields Zoya provides directly
+        revenue = report.get("revenueBreakdown") or {}
+        haram_rev = revenue.get("haramRevenue")      # e.g. 0.02 = 2%
+        ratios = {
+            "debt_ratio":          report.get("debtRatio"),
+            "interest_bearing_pct": report.get("interestBearingSecuritiesRatio"),
+            "cash_interest_pct":    report.get("cashAndInterestBearingSecuritiesRatio"),
+            "haram_revenue_pct":    haram_rev,
+            "halal_revenue_pct":    revenue.get("halalRevenue"),
+        }
+        # Remove None values so callers can check presence cleanly
+        ratios = {k: v for k, v in ratios.items() if v is not None}
+        logger.info(f"Zoya ratios for {symbol}: {ratios}")
+
         return {
             "status":  status,
             "sector":  report.get("exchange", ""),
+            "ratios":  ratios,
             "raw":     report,
         }
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Zoya HTTP error for {symbol}: {e} — {e.response.text[:200]}")
+        return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
+    except Exception as e:
+        logger.error(f"Unexpected Zoya error for {symbol}: {e}")
+        return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
+
+
+def _zoya_screen_basic(symbol: str) -> dict:
+    """Fallback minimal Zoya query — used when the extended query fails (e.g. plan limits)."""
+    query = """
+    query GetCompliance($symbol: String!) {
+      basicCompliance {
+        report(symbol: $symbol) {
+          symbol
+          name
+          exchange
+          status
+        }
+      }
+    }
+    """
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.post(
+                ZOYA_BASE_URL,
+                json={"query": query, "variables": {"symbol": symbol}},
+                headers={"Authorization": ZOYA_API_KEY, "Content-Type": "application/json"},
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        report = data.get("data", {}).get("basicCompliance", {}).get("report", {})
+        if not report:
+            return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": data}
+        raw_status = report.get("status", "unknown").upper()
+        status_map = {
+            "COMPLIANT": HalalStatus.COMPLIANT, "HALAL": HalalStatus.COMPLIANT,
+            "NON_COMPLIANT": HalalStatus.NON_COMPLIANT, "NOT_HALAL": HalalStatus.NON_COMPLIANT,
+            "HARAM": HalalStatus.NON_COMPLIANT, "QUESTIONABLE": HalalStatus.DOUBTFUL,
+            "DOUBTFUL": HalalStatus.DOUBTFUL, "UNKNOWN": HalalStatus.UNKNOWN,
+        }
+        return {
+            "status": status_map.get(raw_status, HalalStatus.UNKNOWN),
+            "sector": report.get("exchange", ""),
+            "ratios": {},
+            "raw":    report,
+        }
+    except Exception as e:
+        logger.error(f"Zoya basic fallback failed for {symbol}: {e}")
+        return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
 
     except httpx.HTTPStatusError as e:
         logger.error(f"Zoya HTTP error for {symbol}: {e} — {e.response.text[:200]}")
@@ -261,35 +343,68 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
         return result
 
     # ── Layer 2: Financial ratios ──
-    try:
-        profile_resp = httpx.get(
-            f"{FINNHUB_BASE_URL}/stock/profile2",
-            params={"symbol": symbol},
-            headers={"X-Finnhub-Token": FINNHUB_API_KEY},
-            timeout=5,
-            follow_redirects=True,
-        )
-        company_name = profile_resp.json().get("name", symbol) if profile_resp.is_success else symbol
-    except Exception:
-        company_name = symbol
+    # Prefer Zoya's own ratio data (already fetched above).
+    # Only call Finnhub+Claude if Zoya didn't return the ratio fields.
+    zoya_ratios = zoya.get("ratios", {})
 
-    ratios     = _ratio_screen(symbol, company_name)
-    ratio_pass = ratios.get("ratio_pass")
+    if zoya_ratios:
+        # Zoya provided the ratios directly — no Finnhub call needed
+        logger.info(f"Using Zoya-supplied ratios for {symbol}: {zoya_ratios}")
+        debt_ratio          = zoya_ratios.get("debt_ratio")
+        interest_income_pct = zoya_ratios.get("interest_bearing_pct")
+        haram_revenue_pct   = zoya_ratios.get("haram_revenue_pct")
+
+        # Evaluate against AAOIFI thresholds
+        debt_ok     = debt_ratio is None or debt_ratio < 0.33
+        interest_ok = interest_income_pct is None or interest_income_pct < 0.05
+        haram_ok    = haram_revenue_pct is None or haram_revenue_pct < 0.05
+
+        if debt_ratio is not None or haram_revenue_pct is not None:
+            ratio_pass = debt_ok and interest_ok and haram_ok
+        else:
+            ratio_pass = None  # No ratio data from Zoya either
+
+        parts = []
+        if debt_ratio is not None:
+            parts.append(f"Debt {debt_ratio*100:.1f}% ({'✓' if debt_ok else '✗'} <33%)")
+        if interest_income_pct is not None:
+            parts.append(f"Interest income {interest_income_pct*100:.1f}% ({'✓' if interest_ok else '✗'} <5%)")
+        if haram_revenue_pct is not None:
+            parts.append(f"Haram revenue {haram_revenue_pct*100:.1f}% ({'✓' if haram_ok else '✗'} <5%)")
+        notes = "Zoya ratios: " + " | ".join(parts) if parts else "Zoya did not supply ratio detail."
+    else:
+        # Zoya didn't return ratios — fall back to Finnhub + Claude
+        logger.info(f"Zoya gave no ratios for {symbol}, falling back to Finnhub")
+        try:
+            profile_resp = httpx.get(
+                f"{FINNHUB_BASE_URL}/stock/profile2",
+                params={"symbol": symbol},
+                headers={"X-Finnhub-Token": FINNHUB_API_KEY},
+                timeout=5,
+                follow_redirects=True,
+            )
+            company_name = profile_resp.json().get("name", symbol) if profile_resp.is_success else symbol
+        except Exception:
+            company_name = symbol
+
+        ratios              = _ratio_screen(symbol, company_name)
+        ratio_pass          = ratios.get("ratio_pass")
+        debt_ratio          = ratios.get("debt_ratio")
+        interest_income_pct = ratios.get("interest_income_pct")
+        haram_revenue_pct   = ratios.get("haram_revenue_pct")
+        notes               = ratios.get("notes", "")
 
     # Decision matrix:
-    # - Zoya COMPLIANT + ratios pass      → COMPLIANT
-    # - Zoya COMPLIANT + ratios unavailable → COMPLIANT (trust Zoya; Finnhub free tier
-    #   is unreliable and rate-limits frequently — don't penalise for missing data)
-    # - Zoya COMPLIANT + ratios fail       → NON_COMPLIANT (explicit financial violation)
-    # - Zoya NON_COMPLIANT (any ratios)    → NON_COMPLIANT (hard sector block)
+    # - Zoya NON_COMPLIANT                 → NON_COMPLIANT (hard sector block)
+    # - ratio_pass explicitly False        → NON_COMPLIANT (financial violation)
+    # - Zoya COMPLIANT                     → COMPLIANT (trust Zoya as authoritative)
     # - Zoya DOUBTFUL                      → DOUBTFUL
-    # - Zoya UNKNOWN                       → UNKNOWN
+    # - else                               → UNKNOWN
     if zoya_status == HalalStatus.NON_COMPLIANT:
         final_status = HalalStatus.NON_COMPLIANT
     elif ratio_pass is False:
         final_status = HalalStatus.NON_COMPLIANT
     elif zoya_status == HalalStatus.COMPLIANT:
-        # Trust Zoya as authoritative — pass regardless of whether ratio data was available
         final_status = HalalStatus.COMPLIANT
     elif zoya_status == HalalStatus.DOUBTFUL:
         final_status = HalalStatus.DOUBTFUL
@@ -301,11 +416,11 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
         "zoya_status":         zoya_status,
         "final_status":        final_status,
         "sector":              zoya.get("sector", ""),
-        "debt_ratio":          ratios.get("debt_ratio"),
-        "interest_income_pct": ratios.get("interest_income_pct"),
-        "haram_revenue_pct":   ratios.get("haram_revenue_pct"),
+        "debt_ratio":          debt_ratio,
+        "interest_income_pct": interest_income_pct,
+        "haram_revenue_pct":   haram_revenue_pct,
         "ratio_pass":          ratio_pass,
-        "notes":               ratios.get("notes", ""),
+        "notes":               notes,
         "from_cache":          False,
     }
     _save_result(result, db)
