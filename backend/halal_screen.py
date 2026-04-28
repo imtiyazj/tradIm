@@ -8,6 +8,7 @@ Result is cached in PostgreSQL for 7 days to minimise API calls.
 """
 
 import os
+import time
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -72,77 +73,112 @@ def _zoya_screen(symbol: str) -> dict:
 
     logger.info(f"Calling Zoya for {symbol} (key prefix: {ZOYA_API_KEY[:10]}...)")
 
-    try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(ZOYA_BASE_URL, json=payload, headers=headers)
+    # Retry up to 3 times with backoff — Zoya is occasionally slow or drops connections
+    last_error: Exception = Exception("Unknown error")
+    for attempt in range(3):
+        if attempt > 0:
+            wait = 2 ** attempt   # 2s, 4s
+            logger.info(f"Zoya retry {attempt} for {symbol} after {wait}s...")
+            time.sleep(wait)
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.post(ZOYA_BASE_URL, json=payload, headers=headers)
 
-        logger.info(f"Zoya response status: {resp.status_code}")
+            logger.info(f"Zoya response status: {resp.status_code}")
 
-        if resp.status_code == 401:
-            logger.error(f"Zoya 401 — check API key. Response: {resp.text[:200]}")
+            if resp.status_code == 401:
+                logger.error(f"Zoya 401 — check API key. Response: {resp.text[:200]}")
+                return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
+
+            if resp.status_code == 429:
+                logger.warning(f"Zoya rate-limited for {symbol} — will retry")
+                last_error = Exception("Rate limited")
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            # GraphQL field errors (e.g. unknown fields on basic plan) — fall back to minimal query
+            if data.get("errors"):
+                logger.warning(f"Zoya GraphQL errors for {symbol}: {data['errors']} — retrying with basic query")
+                return _zoya_screen_basic(symbol)
+
+            # Navigate basicCompliance.report path
+            report = (
+                data.get("data", {})
+                    .get("basicCompliance", {})
+                    .get("report", {})
+            )
+
+            if not report:
+                logger.warning(f"Zoya returned no report for {symbol}: {data}")
+                return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": data}
+
+            raw_status = report.get("status", "unknown").upper()
+            logger.info(f"Zoya status for {symbol}: {raw_status}")
+
+            status_map = {
+                "COMPLIANT":     HalalStatus.COMPLIANT,
+                "HALAL":         HalalStatus.COMPLIANT,
+                "NON_COMPLIANT": HalalStatus.NON_COMPLIANT,
+                "NOT_HALAL":     HalalStatus.NON_COMPLIANT,
+                "HARAM":         HalalStatus.NON_COMPLIANT,
+                "QUESTIONABLE":  HalalStatus.DOUBTFUL,
+                "DOUBTFUL":      HalalStatus.DOUBTFUL,
+                "UNKNOWN":       HalalStatus.UNKNOWN,
+            }
+            status = status_map.get(raw_status, HalalStatus.UNKNOWN)
+
+            # Extract ratio fields Zoya provides directly
+            revenue = report.get("revenueBreakdown") or {}
+            ratios = {
+                "debt_ratio":           report.get("debtRatio"),
+                "interest_bearing_pct": report.get("interestBearingSecuritiesRatio"),
+                "cash_interest_pct":    report.get("cashAndInterestBearingSecuritiesRatio"),
+                "haram_revenue_pct":    revenue.get("haramRevenue"),
+                "halal_revenue_pct":    revenue.get("halalRevenue"),
+            }
+            ratios = {k: v for k, v in ratios.items() if v is not None}
+            logger.info(f"Zoya ratios for {symbol}: {ratios}")
+
+            return {
+                "status":  status,
+                "sector":  report.get("exchange", ""),
+                "ratios":  ratios,
+                "raw":     report,
+            }
+
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            logger.warning(f"Zoya connection error for {symbol} (attempt {attempt+1}/3): {e}")
+            last_error = e
+            continue
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Zoya HTTP error for {symbol}: {e} — {e.response.text[:200]}")
             return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
+        except Exception as e:
+            logger.error(f"Unexpected Zoya error for {symbol}: {e}")
+            last_error = e
+            continue
 
-        resp.raise_for_status()
-        data = resp.json()
+    # All retries exhausted — Zoya is down, fall back to Finnhub-only screen
+    logger.error(f"Zoya unavailable for {symbol} after 3 attempts ({last_error}) — using Finnhub fallback")
+    return _zoya_unavailable_fallback(symbol)
 
-        # GraphQL field errors (e.g. unknown fields on basic plan) — fall back to minimal query
-        if data.get("errors"):
-            logger.warning(f"Zoya GraphQL errors for {symbol}: {data['errors']} — retrying with basic query")
-            return _zoya_screen_basic(symbol)
 
-        # Navigate basicCompliance.report path
-        report = (
-            data.get("data", {})
-                .get("basicCompliance", {})
-                .get("report", {})
-        )
-
-        if not report:
-            logger.warning(f"Zoya returned no report for {symbol}: {data}")
-            return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": data}
-
-        raw_status = report.get("status", "unknown").upper()
-        logger.info(f"Zoya status for {symbol}: {raw_status}")
-
-        status_map = {
-            "COMPLIANT":     HalalStatus.COMPLIANT,
-            "HALAL":         HalalStatus.COMPLIANT,
-            "NON_COMPLIANT": HalalStatus.NON_COMPLIANT,
-            "NOT_HALAL":     HalalStatus.NON_COMPLIANT,
-            "HARAM":         HalalStatus.NON_COMPLIANT,
-            "QUESTIONABLE":  HalalStatus.DOUBTFUL,
-            "DOUBTFUL":      HalalStatus.DOUBTFUL,
-            "UNKNOWN":       HalalStatus.UNKNOWN,
-        }
-        status = status_map.get(raw_status, HalalStatus.UNKNOWN)
-
-        # Extract ratio fields Zoya provides directly
-        revenue = report.get("revenueBreakdown") or {}
-        haram_rev = revenue.get("haramRevenue")      # e.g. 0.02 = 2%
-        ratios = {
-            "debt_ratio":          report.get("debtRatio"),
-            "interest_bearing_pct": report.get("interestBearingSecuritiesRatio"),
-            "cash_interest_pct":    report.get("cashAndInterestBearingSecuritiesRatio"),
-            "haram_revenue_pct":    haram_rev,
-            "halal_revenue_pct":    revenue.get("halalRevenue"),
-        }
-        # Remove None values so callers can check presence cleanly
-        ratios = {k: v for k, v in ratios.items() if v is not None}
-        logger.info(f"Zoya ratios for {symbol}: {ratios}")
-
-        return {
-            "status":  status,
-            "sector":  report.get("exchange", ""),
-            "ratios":  ratios,
-            "raw":     report,
-        }
-
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Zoya HTTP error for {symbol}: {e} — {e.response.text[:200]}")
-        return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
-    except Exception as e:
-        logger.error(f"Unexpected Zoya error for {symbol}: {e}")
-        return {"status": HalalStatus.UNKNOWN, "sector": "", "ratios": {}, "raw": {}}
+def _zoya_unavailable_fallback(symbol: str) -> dict:
+    """
+    Called when Zoya API is unreachable after retries.
+    Returns DOUBTFUL (not UNKNOWN) so the stock isn't silently skipped,
+    and uses Finnhub+Claude for ratio screening where possible.
+    The stock can still be shown with a clear note rather than a cryptic error.
+    """
+    return {
+        "status":  HalalStatus.DOUBTFUL,
+        "sector":  "",
+        "ratios":  {},
+        "raw":     {},
+        "zoya_unavailable": True,
+    }
 
 
 def _zoya_screen_basic(symbol: str) -> dict:
@@ -268,8 +304,10 @@ def _get_cached(symbol: str, db: Session) -> Optional[HalalScreenResult]:
     )
 
 
-def _cache_ttl(final_status) -> int:
+def _cache_ttl(final_status, zoya_unavailable: bool = False) -> int:
     """Return cache TTL in days based on the screening result."""
+    if zoya_unavailable:
+        return 1   # Re-try tomorrow — this was a transient API failure
     if final_status == HalalStatus.NON_COMPLIANT:
         return CACHE_DAYS_NON_COMPLIANT  # 15 days — no need to re-check frequently
     if final_status == HalalStatus.COMPLIANT:
@@ -288,7 +326,7 @@ def _save_result(result: dict, db: Session) -> HalalScreenResult:
         ratio_pass          = result.get("ratio_pass"),
         final_status        = result["final_status"],
         notes               = result.get("notes", ""),
-        expires_at          = datetime.now(timezone.utc) + timedelta(days=_cache_ttl(result["final_status"])),
+        expires_at          = datetime.now(timezone.utc) + timedelta(days=_cache_ttl(result["final_status"], result.get("zoya_unavailable", False))),
     )
     db.add(record)
     db.commit()
@@ -322,8 +360,9 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
     logger.info(f"Running fresh halal screen for {symbol}")
 
     # ── Layer 1: Zoya ──
-    zoya        = _zoya_screen(symbol)
-    zoya_status = zoya["status"]
+    zoya             = _zoya_screen(symbol)
+    zoya_status      = zoya["status"]
+    zoya_unavailable = zoya.get("zoya_unavailable", False)
 
     # Hard block — skip ratio check entirely
     if zoya_status == HalalStatus.NON_COMPLIANT:
@@ -371,7 +410,12 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
             parts.append(f"Interest income {interest_income_pct*100:.1f}% ({'✓' if interest_ok else '✗'} <5%)")
         if haram_revenue_pct is not None:
             parts.append(f"Haram revenue {haram_revenue_pct*100:.1f}% ({'✓' if haram_ok else '✗'} <5%)")
-        notes = "Zoya ratios: " + " | ".join(parts) if parts else "Zoya did not supply ratio detail."
+        if parts:
+            notes = "Zoya ratios: " + " | ".join(parts)
+        elif zoya_unavailable:
+            notes = "Zoya screening service was temporarily unavailable. Ratio data pending — will recheck on next refresh."
+        else:
+            notes = "Zoya verified compliance. Detailed ratio breakdown not provided for this symbol."
     else:
         # Zoya didn't return ratios — fall back to Finnhub + Claude
         logger.info(f"Zoya gave no ratios for {symbol}, falling back to Finnhub")
@@ -421,6 +465,7 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
         "haram_revenue_pct":   haram_revenue_pct,
         "ratio_pass":          ratio_pass,
         "notes":               notes,
+        "zoya_unavailable":    zoya_unavailable,
         "from_cache":          False,
     }
     _save_result(result, db)
