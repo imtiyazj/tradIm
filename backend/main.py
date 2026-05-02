@@ -728,6 +728,29 @@ def get_trade_size(symbol: str, confidence: float):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Technicals + Earnings ─────────────────────────────────────────────────────
+
+@app.get("/api/technicals/{symbol}", tags=["data"])
+def get_technicals(symbol: str):
+    import technicals as t
+    data = t.get_indicators(symbol.upper())
+    if not data:
+        raise HTTPException(status_code=404, detail=f"No technical data for {symbol}")
+    return data
+
+
+@app.get("/api/earnings/{symbol}", tags=["data"])
+def get_earnings(symbol: str):
+    import earnings as e
+    days = e.days_until_earnings(symbol.upper())
+    next_e = e.get_next_earnings(symbol.upper())
+    return {
+        "days_until": days,
+        "next_date":  next_e["date"] if next_e else None,
+        "imminent":   days is not None and days <= 3,
+    }
+
+
 # ── Utility ───────────────────────────────────────────────────────────────────
 
 def _get_default_user_id(db: Session):

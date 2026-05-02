@@ -4,6 +4,20 @@ import { api, Signal } from "@/lib/api";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+// ── Technicals + Earnings shapes ──────────────────────────────────────────────
+
+interface TechIndicators {
+  rsi: number;
+  rsi_signal: "oversold" | "neutral" | "overbought";
+  macd_trend: "bullish" | "bearish" | "neutral";
+  verdict: "bullish" | "bearish" | "neutral";
+}
+interface EarningsInfo {
+  days_until: number | null;
+  next_date: string | null;
+  imminent: boolean;
+}
+
 // ── Trade size shape returned by /api/trade/size ──────────────────────────────
 
 interface SizeInfo {
@@ -204,6 +218,8 @@ export default function SignalsPage() {
   const [loading, setLoading]       = useState(true);
   const [toast, setToast]           = useState("");
   const [execModal, setExecModal]   = useState<Signal | null>(null);
+  const [techMap, setTechMap]       = useState<Record<string, TechIndicators>>({});
+  const [earningsMap, setEarningsMap] = useState<Record<string, EarningsInfo>>({});
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(""), 4000); };
 
@@ -211,6 +227,20 @@ export default function SignalsPage() {
     setLoading(true);
     api.signals.list(days).then(setSignals).catch(console.error).finally(() => setLoading(false));
   }, [days]);
+
+  useEffect(() => {
+    const symbols = Array.from(new Set(signals.map(s => s.symbol)));
+    symbols.forEach(async sym => {
+      try {
+        const r = await fetch(`${API_URL}/api/technicals/${sym}`);
+        if (r.ok) setTechMap(prev => ({ ...prev, [sym]: await r.json() }));
+      } catch {}
+      try {
+        const r = await fetch(`${API_URL}/api/earnings/${sym}`);
+        if (r.ok) setEarningsMap(prev => ({ ...prev, [sym]: await r.json() }));
+      } catch {}
+    });
+  }, [signals]);
 
   const filtered = filter === "all" ? signals : signals.filter(s => s.type === filter);
   const typeColor: Record<string, string> = {
@@ -280,6 +310,37 @@ export default function SignalsPage() {
                 {s.acted_on && <span className="badge badge-blue">acted on</span>}
               </div>
               <p style={{ fontSize: 13, color: "var(--text2)", lineHeight: 1.65 }}>{s.reasoning}</p>
+              {(techMap[s.symbol] || earningsMap[s.symbol]?.imminent) && (
+                <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                  {techMap[s.symbol] && (
+                    <>
+                      <span className={`badge ${
+                        techMap[s.symbol].rsi_signal === "oversold" ? "badge-green" :
+                        techMap[s.symbol].rsi_signal === "overbought" ? "badge-red" : "badge-muted"
+                      }`} style={{ fontSize: 10 }}>
+                        RSI {techMap[s.symbol].rsi.toFixed(1)}
+                      </span>
+                      <span className={`badge ${
+                        techMap[s.symbol].macd_trend === "bullish" ? "badge-green" :
+                        techMap[s.symbol].macd_trend === "bearish" ? "badge-red" : "badge-muted"
+                      }`} style={{ fontSize: 10 }}>
+                        MACD {techMap[s.symbol].macd_trend === "bullish" ? "↑" : techMap[s.symbol].macd_trend === "bearish" ? "↓" : "→"} {techMap[s.symbol].macd_trend}
+                      </span>
+                      <span className={`badge ${
+                        techMap[s.symbol].verdict === "bullish" ? "badge-green" :
+                        techMap[s.symbol].verdict === "bearish" ? "badge-red" : "badge-muted"
+                      }`} style={{ fontSize: 10 }}>
+                        tech: {techMap[s.symbol].verdict}
+                      </span>
+                    </>
+                  )}
+                  {earningsMap[s.symbol]?.imminent && (
+                    <span className="badge badge-red" style={{ fontSize: 10 }}>
+                      ⚠️ Earnings in {earningsMap[s.symbol].days_until}d
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
 
             <div style={{ textAlign: "right", flexShrink: 0 }}>

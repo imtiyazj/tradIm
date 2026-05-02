@@ -86,6 +86,8 @@ def analyse_stocks(
     watchlist: list[dict],
     market_data: dict,
     news_items: list[dict],
+    technicals: dict = None,
+    earnings: dict = None,
 ) -> dict:
     """
     Run morning analysis on the watchlist.
@@ -112,6 +114,15 @@ MARKET DATA (prices, % change, volume):
 
 RECENT NEWS:
 {json.dumps(news_items[:20], indent=2)}
+
+TECHNICAL INDICATORS (RSI 0-100, MACD trend):
+{json.dumps(technicals or {}, indent=2)}
+
+EARNINGS CALENDAR (days until next earnings):
+{json.dumps(earnings or {}, indent=2)}
+
+Use the RSI + MACD verdict to confirm or temper your directional bias. If technicals contradict your read (e.g. you see 'buy' but MACD is bearish), reduce confidence and explain the tension in reasoning.
+If earnings are imminent (≤3 days), prefer 'watch' over 'buy' unless conviction is exceptional. Always mention imminent earnings in reasoning.
 
 Return a JSON object with exactly these keys:
 {{
@@ -403,6 +414,8 @@ def analyse_discovery(
     market_data: dict,
     news_by_symbol: dict,
     top_n: int = 10,
+    technicals: dict = None,
+    earnings: dict = None,
 ) -> dict:
     """
     Rank and analyse halal-compliant stock candidates for discovery.
@@ -444,6 +457,15 @@ MARKET DATA (price, % change, volume):
 
 RECENT NEWS BY SYMBOL:
 {json.dumps(news_by_symbol, indent=2)}
+
+TECHNICAL INDICATORS (RSI 0-100, MACD trend):
+{json.dumps(technicals or {}, indent=2)}
+
+EARNINGS CALENDAR (days until next earnings):
+{json.dumps(earnings or {}, indent=2)}
+
+Use the RSI + MACD verdict to confirm or temper your directional bias. If technicals contradict your read (e.g. you see 'buy' but MACD is bearish), reduce confidence and explain the tension in reasoning.
+If earnings are imminent (≤3 days), prefer 'watch' over 'buy' unless conviction is exceptional. Always mention imminent earnings in reasoning.
 
 Your task:
 1. Identify the top {top_n} opportunities from this universe

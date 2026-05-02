@@ -293,6 +293,17 @@ def run_discovery(
     top_syms  = [c["symbol"] for c in top_candidates]
     news_data = _fetch_news_batch(top_syms)
 
+    # ── 4.5 Technical indicators + earnings calendar ──
+    import technicals as technicals_module
+    import earnings as earnings_module
+
+    technicals_data = technicals_module.get_indicators_batch(top_syms)
+    earnings_data   = earnings_module.get_earnings_batch(top_syms)
+    logger.info(
+        f"Discovery technicals: {len([t for t in technicals_data.values() if t])} got data | "
+        f"Earnings imminent: {sum(1 for e in earnings_data.values() if e.get('imminent'))}"
+    )
+
     # ── 5. Claude ranks and analyses top candidates ──
     logger.info("Running Claude discovery analysis...")
     claude_result = claude_module.analyse_discovery(
@@ -300,6 +311,8 @@ def run_discovery(
         market_data  = {c["symbol"]: c["market_data"] for c in top_candidates},
         news_by_symbol = news_data,
         top_n        = top_n,
+        technicals   = technicals_data,
+        earnings     = earnings_data,
     )
 
     return {

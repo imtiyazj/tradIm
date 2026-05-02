@@ -344,10 +344,26 @@ def morning_job():
             for r in halal_passed
         ]
 
+        # ── 3.5 Technical indicators + earnings calendar ──
+        import technicals as technicals_module
+        import earnings as earnings_module
+
+        logger.info(f"Fetching technical indicators for {len(halal_symbols)} symbols...")
+        technicals_data = technicals_module.get_indicators_batch(halal_symbols)
+
+        logger.info(f"Fetching earnings calendar for {len(halal_symbols)} symbols...")
+        earnings_data = earnings_module.get_earnings_batch(halal_symbols)
+
+        logger.info(
+            f"Technicals: {len([t for t in technicals_data.values() if t])} got data | "
+            f"Earnings imminent: {sum(1 for e in earnings_data.values() if e.get('imminent'))}"
+        )
+
         # ── 4. Claude analysis ──
         logger.info("Running Claude analysis...")
         analysis = claude_module.analyse_stocks(
-            watchlist_for_claude, market_data, news_items
+            watchlist_for_claude, market_data, news_items,
+            technicals=technicals_data, earnings=earnings_data,
         )
 
         signals    = analysis.get("signals", [])
