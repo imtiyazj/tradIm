@@ -27,6 +27,9 @@ from db.models import (
 )
 import halal_screen as halal_module
 import claude as claude_module
+import risk as risk_module
+
+ALPACA_DATA_URL = "https://data.alpaca.markets"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -462,12 +465,72 @@ def refresh_discovery(
     return discovery_module.run_discovery(db=db, top_n=top_n, min_price=min_price)
 
 
+# ── Account ───────────────────────────────────────────────────────────────────
+
+@app.get("/api/account", tags=["trading"])
+def get_account():
+    """Fetch Alpaca account info — portfolio value, cash, buying power, equity."""
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        raise HTTPException(status_code=503, detail="Alpaca credentials not configured")
+    try:
+        resp = requests.get(
+            f"{ALPACA_BASE_URL}/v2/account",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET,
+            },
+            timeout=10,
+        )
+        resp.raise_for_status()
+        acct = resp.json()
+        return {
+            "portfolio_value": float(acct.get("portfolio_value") or acct.get("equity") or 0),
+            "cash":            float(acct.get("cash", 0)),
+            "buying_power":    float(acct.get("buying_power", 0)),
+            "equity":          float(acct.get("equity", 0)),
+            "paper":           "paper" in ALPACA_BASE_URL,
+        }
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response else str(e)
+        logger.error(f"Alpaca account fetch failed: {detail}")
+        raise HTTPException(status_code=502, detail=f"Alpaca error: {detail}")
+    except Exception as e:
+        logger.error(f"Account fetch error: {e}")
+        raise HTTPException(status_code=503, detail="Could not reach Alpaca API.")
+
+
+def _fetch_alpaca_price(symbol: str) -> float:
+    """Fetch the latest trade price for a symbol via Alpaca market data."""
+    resp = requests.get(
+        f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/snapshot",
+        params={"feed": "iex"},
+        headers={
+            "APCA-API-KEY-ID":     ALPACA_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET,
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    # latestTrade.p is the most reliable price field from the snapshot
+    price = (
+        data.get("latestTrade", {}).get("p")
+        or data.get("latestQuote", {}).get("ap")
+        or data.get("minuteBar", {}).get("c")
+        or 0
+    )
+    return float(price)
+
+
 # ── Paper trading ─────────────────────────────────────────────────────────────
 
 class TradeRequest(BaseModel):
     symbol: str
     qty: float
     side: str  # "buy" | "sell"
+    confidence: Optional[float] = None
+    auto_size:  bool = False  # if True, calculate qty from portfolio value using risk.py
+    use_bracket: bool = True  # if True, place bracket order with stop-loss + take-profit
 
     @field_validator("symbol")
     @classmethod
@@ -494,19 +557,77 @@ class TradeRequest(BaseModel):
 def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
     """
     Place a paper (or live) market order via Alpaca.
-    Currently wired to Alpaca paper trading by default.
+    Supports auto-sizing by confidence and bracket orders with stop-loss + take-profit.
     """
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise HTTPException(status_code=503, detail="Alpaca credentials not configured")
 
-    payload = {
-        "symbol":        req.symbol,
-        "qty":           str(req.qty),
-        "side":          req.side,
-        "type":          "market",
-        "time_in_force": "day",
-    }
+    qty           = req.qty
+    current_price = 0.0
+    portfolio_pct = None
+    sl_price      = None
+    tp_price      = None
+    is_paper      = "paper" in ALPACA_BASE_URL
+
     try:
+        # ── Auto-sizing ──────────────────────────────────────────────────────
+        if req.auto_size and req.confidence is not None:
+            # Fetch portfolio value
+            acct_resp = requests.get(
+                f"{ALPACA_BASE_URL}/v2/account",
+                headers={
+                    "APCA-API-KEY-ID":     ALPACA_KEY,
+                    "APCA-API-SECRET-KEY": ALPACA_SECRET,
+                },
+                timeout=10,
+            )
+            acct_resp.raise_for_status()
+            acct         = acct_resp.json()
+            portfolio_val = float(acct.get("portfolio_value") or acct.get("equity") or 0)
+
+            # Fetch current price
+            current_price = _fetch_alpaca_price(req.symbol)
+            if current_price <= 0:
+                raise HTTPException(status_code=422, detail=f"Could not fetch price for {req.symbol}")
+
+            qty           = risk_module.position_size_shares(req.confidence, portfolio_val, current_price)
+            portfolio_pct = risk_module._portfolio_pct(req.confidence) * 100
+            if qty <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Confidence {req.confidence:.0%} is below minimum {risk_module.MIN_CONFIDENCE:.0%} — trade skipped.",
+                )
+
+        # ── Fetch price for bracket order (if not already fetched) ───────────
+        if req.use_bracket and req.side == "buy" and current_price <= 0:
+            try:
+                current_price = _fetch_alpaca_price(req.symbol)
+            except Exception as e:
+                logger.warning(f"Could not fetch price for bracket; falling back to market-only: {e}")
+
+        # ── Build order payload ──────────────────────────────────────────────
+        if req.use_bracket and req.side == "buy" and current_price > 0:
+            sl_price = risk_module.stop_loss_price(current_price)
+            tp_price = risk_module.take_profit_price(current_price)
+            payload = {
+                "symbol":        req.symbol,
+                "qty":           str(qty),
+                "side":          "buy",
+                "type":          "market",
+                "time_in_force": "day",
+                "order_class":   "bracket",
+                "stop_loss":     {"stop_price": str(sl_price)},
+                "take_profit":   {"limit_price": str(tp_price)},
+            }
+        else:
+            payload = {
+                "symbol":        req.symbol,
+                "qty":           str(qty),
+                "side":          req.side,
+                "type":          "market",
+                "time_in_force": "day",
+            }
+
         resp = requests.post(
             f"{ALPACA_BASE_URL}/v2/orders",
             json=payload,
@@ -518,44 +639,92 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
         )
         resp.raise_for_status()
         order = resp.json()
-        logger.info(f"Order placed: {req.side} {req.qty} {req.symbol} id={order.get('id')}")
+        logger.info(f"Order placed: {req.side} {qty} {req.symbol} id={order.get('id')} bracket={req.use_bracket and req.side == 'buy'}")
 
         # Log to Trade table
         from db.models import Trade, TradeSide
-        user_id = _get_default_user_id(db)
-        # Market orders don't fill instantly — filled_avg_price is null at submission.
-        # Use submitted_at from the order response, fall back to now().
+        user_id      = _get_default_user_id(db)
         filled_price = float(order.get("filled_avg_price") or 0)
         trade = Trade(
-            user_id          = user_id,
-            alpaca_order_id  = order.get("id"),
-            symbol           = req.symbol,
-            side             = TradeSide.BUY if req.side == "buy" else TradeSide.SELL,
-            quantity         = req.qty,
-            price            = filled_price,
-            total_value      = filled_price * req.qty,
-            halal_status     = "compliant",
-            is_paper         = "paper" in ALPACA_BASE_URL,
-            traded_at        = datetime.now(timezone.utc),
+            user_id         = user_id,
+            alpaca_order_id = order.get("id"),
+            symbol          = req.symbol,
+            side            = TradeSide.BUY if req.side == "buy" else TradeSide.SELL,
+            quantity        = qty,
+            price           = filled_price,
+            total_value     = filled_price * qty,
+            halal_status    = "compliant",
+            is_paper        = is_paper,
+            traded_at       = datetime.now(timezone.utc),
         )
         db.add(trade)
         db.commit()
 
         return {
-            "ok":       True,
-            "order_id": order.get("id"),
-            "symbol":   req.symbol,
-            "side":     req.side,
-            "qty":      req.qty,
-            "status":   order.get("status"),
-            "paper":    "paper" in ALPACA_BASE_URL,
+            "ok":              True,
+            "order_id":        order.get("id"),
+            "symbol":          req.symbol,
+            "side":            req.side,
+            "qty":             qty,
+            "status":          order.get("status"),
+            "stop_loss_price": sl_price,
+            "take_profit_price": tp_price,
+            "portfolio_pct":   portfolio_pct,
+            "paper":           is_paper,
         }
+    except HTTPException:
+        raise
     except requests.HTTPError as e:
         detail = e.response.text if e.response else str(e)
         logger.error(f"Alpaca order failed: {detail}")
         raise HTTPException(status_code=502, detail=f"Alpaca error: {detail}")
     except Exception as e:
         logger.error(f"Trade placement error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/trade/size", tags=["trading"])
+def get_trade_size(symbol: str, confidence: float):
+    """
+    Calculate position size for a symbol + confidence score.
+    Fetches live account value and current price from Alpaca.
+    Returns a full risk sizing summary.
+    """
+    if not ALPACA_KEY or not ALPACA_SECRET:
+        raise HTTPException(status_code=503, detail="Alpaca credentials not configured")
+    try:
+        # Fetch portfolio value
+        acct_resp = requests.get(
+            f"{ALPACA_BASE_URL}/v2/account",
+            headers={
+                "APCA-API-KEY-ID":     ALPACA_KEY,
+                "APCA-API-SECRET-KEY": ALPACA_SECRET,
+            },
+            timeout=10,
+        )
+        acct_resp.raise_for_status()
+        acct          = acct_resp.json()
+        portfolio_val = float(acct.get("portfolio_value") or acct.get("equity") or 0)
+
+        # Fetch current price
+        current_price = _fetch_alpaca_price(symbol.upper())
+        if current_price <= 0:
+            raise HTTPException(status_code=422, detail=f"Could not fetch price for {symbol}")
+
+        summary = risk_module.size_summary(confidence, portfolio_val, current_price)
+        summary["symbol"]          = symbol.upper()
+        summary["price"]           = round(current_price, 2)
+        summary["portfolio_value"] = round(portfolio_val, 2)
+        summary["paper"]           = "paper" in ALPACA_BASE_URL
+        return summary
+    except HTTPException:
+        raise
+    except requests.HTTPError as e:
+        detail = e.response.text if e.response else str(e)
+        logger.error(f"Trade size fetch failed: {detail}")
+        raise HTTPException(status_code=502, detail=f"Alpaca error: {detail}")
+    except Exception as e:
+        logger.error(f"Trade size error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

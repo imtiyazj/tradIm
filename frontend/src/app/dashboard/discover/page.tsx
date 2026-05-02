@@ -13,19 +13,52 @@ interface DiscoveryPick {
   suggested_action: string;
 }
 
-interface TradeModalProps {
-  symbol: string;
-  price:  number;
-  side:   "buy" | "sell";
-  onClose: () => void;
-  showToast: (msg: string) => void;
+interface SizeInfo {
+  dollars:         number;
+  shares:          number;
+  stop_loss:       number;
+  take_profit:     number;
+  portfolio_pct:   number;
+  confidence_tier: string;
+  tradeable:       boolean;
+  price:           number;
+  portfolio_value: number;
 }
 
-function TradeModal({ symbol, price, side, onClose, showToast }: TradeModalProps) {
-  const [qty, setQty]         = useState("1");
-  const [loading, setLoading] = useState(false);
+interface TradeModalProps {
+  symbol:     string;
+  price:      number;
+  side:       "buy" | "sell";
+  confidence?: number;
+  onClose:    () => void;
+  showToast:  (msg: string) => void;
+}
 
-  const total = (parseFloat(qty) || 0) * price;
+function TradeModal({ symbol, price, side, confidence, onClose, showToast }: TradeModalProps) {
+  const [qty, setQty]             = useState("1");
+  const [loading, setLoading]     = useState(false);
+  const [sizeInfo, setSizeInfo]   = useState<SizeInfo | null>(null);
+  const [loadingSize, setLoadingSize] = useState(false);
+
+  const total    = (parseFloat(qty) || 0) * price;
+  const isBuy    = side === "buy";
+  const useBracket = isBuy;
+
+  // Prefill qty from /api/trade/size when opening for a buy with confidence
+  useEffect(() => {
+    if (!isBuy || confidence == null || confidence < 0.65) return;
+    setLoadingSize(true);
+    fetch(`${API_URL}/api/trade/size?symbol=${symbol}&confidence=${confidence}`)
+      .then(r => r.json())
+      .then((data: SizeInfo & { detail?: string }) => {
+        if (!data.detail && data.shares > 0) {
+          setSizeInfo(data);
+          setQty(String(data.shares));
+        }
+      })
+      .catch(() => { /* ignore — user can enter manually */ })
+      .finally(() => setLoadingSize(false));
+  }, [symbol, confidence, isBuy]);
 
   const submit = async () => {
     const parsedQty = parseFloat(qty);
@@ -33,13 +66,20 @@ function TradeModal({ symbol, price, side, onClose, showToast }: TradeModalProps
     setLoading(true);
     try {
       const res = await fetch(`${API_URL}/api/trade`, {
-        method: "POST",
+        method:  "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol, qty: parsedQty, side }),
+        body:    JSON.stringify({
+          symbol,
+          qty:         parsedQty,
+          side,
+          confidence:  confidence ?? null,
+          auto_size:   false,
+          use_bracket: useBracket,
+        }),
       });
       const data = await res.json();
       if (!res.ok) { showToast(data.detail || "Order failed"); return; }
-      showToast(`✓ Paper ${side.toUpperCase()} ${parsedQty} ${symbol} submitted (order ${data.order_id?.slice(0,8)}…)`);
+      showToast(`✓ Paper ${side.toUpperCase()} ${parsedQty} ${symbol} submitted (order ${data.order_id?.slice(0, 8)}…)`);
       onClose();
     } catch {
       showToast("Order failed — check backend logs");
@@ -49,20 +89,62 @@ function TradeModal({ symbol, price, side, onClose, showToast }: TradeModalProps
   };
 
   return (
-    <div style={{
-      position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
-      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
-    }} onClick={onClose}>
-      <div style={{
-        background: "var(--bg2)", border: "1px solid var(--border2)",
-        borderRadius: "var(--radius)", padding: 28, minWidth: 340, maxWidth: 420,
-      }} onClick={e => e.stopPropagation()}>
+    <div
+      style={{
+        position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
+        display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000,
+      }}
+      onClick={onClose}
+    >
+      <div
+        style={{
+          background: "var(--bg2)", border: "1px solid var(--border2)",
+          borderRadius: "var(--radius)", padding: 28, minWidth: 340, maxWidth: 440,
+        }}
+        onClick={e => e.stopPropagation()}
+      >
         <div style={{ fontFamily: "var(--mono)", fontWeight: 600, fontSize: 16, marginBottom: 4 }}>
-          {side === "buy" ? "📈" : "📉"} Paper {side.toUpperCase()} — {symbol}
+          {isBuy ? "📈" : "📉"} Paper {side.toUpperCase()} — {symbol}
         </div>
-        <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 20 }}>
-          This places a market order on Alpaca paper trading. No real money involved.
+        <div style={{ fontSize: 12, color: "var(--text3)", marginBottom: 16 }}>
+          {useBracket
+            ? "Places a bracket order (with stop-loss + take-profit) on Alpaca paper trading."
+            : "Places a market order on Alpaca paper trading. No real money involved."}
         </div>
+
+        {/* Auto-size info panel */}
+        {loadingSize && (
+          <div style={{ marginBottom: 14 }}>
+            <div className="skeleton" style={{ height: 12, marginBottom: 6, borderRadius: 4 }} />
+            <div className="skeleton" style={{ height: 12, width: "70%", borderRadius: 4 }} />
+          </div>
+        )}
+        {!loadingSize && sizeInfo && isBuy && (
+          <div style={{
+            background: "var(--bg3)", borderRadius: "var(--radius)",
+            padding: "10px 14px", marginBottom: 14, fontSize: 12,
+            display: "flex", flexDirection: "column", gap: 5,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ color: "var(--text3)", fontFamily: "var(--mono)" }}>Portfolio allocation</span>
+              <span style={{ color: "var(--text)", fontFamily: "var(--mono)" }}>
+                {sizeInfo.portfolio_pct}% (${sizeInfo.dollars.toFixed(2)})
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ color: "var(--red)", fontFamily: "var(--mono)" }}>Stop-loss</span>
+              <span style={{ color: "var(--red)", fontFamily: "var(--mono)" }}>
+                ${sizeInfo.stop_loss.toFixed(2)}  (-7%)
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ color: "var(--green)", fontFamily: "var(--mono)" }}>Take-profit</span>
+              <span style={{ color: "var(--green)", fontFamily: "var(--mono)" }}>
+                ${sizeInfo.take_profit.toFixed(2)}  (+15%)
+              </span>
+            </div>
+          </div>
+        )}
 
         <label style={{ fontSize: 12, color: "var(--text2)", display: "block", marginBottom: 6 }}>
           Shares
@@ -95,12 +177,12 @@ function TradeModal({ symbol, price, side, onClose, showToast }: TradeModalProps
             Cancel
           </button>
           <button
-            className={`btn ${side === "buy" ? "btn-primary" : ""}`}
-            style={{ flex: 1, background: side === "sell" ? "var(--red)" : undefined }}
+            className={`btn ${isBuy ? "btn-primary" : ""}`}
+            style={{ flex: 1, background: !isBuy ? "var(--red)" : undefined }}
             onClick={submit}
             disabled={loading}
           >
-            {loading ? "Placing…" : `${side === "buy" ? "Buy" : "Sell"} (Paper)`}
+            {loading ? "Placing…" : `${isBuy ? "Buy" : "Sell"} (Paper)`}
           </button>
         </div>
       </div>
@@ -124,7 +206,7 @@ export default function DiscoverPage() {
   const [loaded, setLoaded]   = useState(false);
   const [topN, setTopN]       = useState(10);
   const [toast, setToast]     = useState("");
-  const [tradeModal, setTradeModal] = useState<{ symbol: string; price: number; side: "buy"|"sell" } | null>(null);
+  const [tradeModal, setTradeModal] = useState<{ symbol: string; price: number; side: "buy"|"sell"; confidence?: number } | null>(null);
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(""), 3000); };
 
@@ -375,7 +457,7 @@ export default function DiscoverPage() {
                       <button
                         className="btn btn-primary"
                         style={{ marginTop: 8, fontSize: 11, padding: "5px 10px", display: "block", width: "100%" }}
-                        onClick={() => setTradeModal({ symbol: pick.symbol, price: pick.price || 0, side: "buy" })}
+                        onClick={() => setTradeModal({ symbol: pick.symbol, price: pick.price || 0, side: "buy", confidence: pick.confidence })}
                       >
                         Buy (Paper)
                       </button>
@@ -395,6 +477,7 @@ export default function DiscoverPage() {
           symbol={tradeModal.symbol}
           price={tradeModal.price}
           side={tradeModal.side}
+          confidence={tradeModal.confidence}
           onClose={() => setTradeModal(null)}
           showToast={showToast}
         />
