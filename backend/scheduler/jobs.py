@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "")
 FINNHUB_API_KEY  = os.environ.get("FINNHUB_API_KEY", "")
 ALPACA_KEY       = os.environ.get("ALPACA_KEY", "")
 ALPACA_SECRET    = os.environ.get("ALPACA_SECRET", "")
@@ -44,8 +43,8 @@ ALPACA_BASE_URL  = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.m
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-POLYGON_BASE  = "https://api.polygon.io/v2"
-FINNHUB_BASE  = "https://finnhub.io/api/v1"
+ALPACA_DATA_URL = "https://data.alpaca.markets"
+FINNHUB_BASE    = "https://finnhub.io/api/v1"
 
 
 # ── Database session factory ──────────────────────────────────────────────────
@@ -62,35 +61,44 @@ def get_db() -> Session:
 
 def fetch_market_data(symbols: list[str]) -> dict:
     """
-    Fetch latest prices from Polygon.io for each symbol.
+    Fetch latest snapshot prices from Alpaca for each symbol.
 
     Returns:
         {"AAPL": {"price": 182.5, "change_pct": 1.2, "volume": 45000000}, ...}
     """
     data = {}
-    headers = {"Authorization": f"Bearer {POLYGON_API_KEY}"}
+    headers = {
+        "APCA-API-KEY-ID":     ALPACA_KEY,
+        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+    }
 
     for symbol in symbols:
         try:
-            url = f"{POLYGON_BASE}/aggs/ticker/{symbol}/prev"
-            resp = requests.get(url, headers=headers, timeout=10)
+            url = f"{ALPACA_DATA_URL}/v2/stocks/{symbol}/snapshot"
+            resp = requests.get(url, params={"feed": "iex"}, headers=headers, timeout=10)
             resp.raise_for_status()
-            results = resp.json().get("results", [])
-            if results:
-                bar = results[0]
-                prev_close = bar.get("c", 0)
-                open_price = bar.get("o", prev_close)
-                change_pct = ((prev_close - open_price) / open_price * 100) if open_price else 0
-                data[symbol] = {
-                    "price":      prev_close,
-                    "open":       open_price,
-                    "high":       bar.get("h"),
-                    "low":        bar.get("l"),
-                    "volume":     bar.get("v"),
-                    "change_pct": round(change_pct, 2),
-                }
+            snap = resp.json()
+            daily        = snap.get("dailyBar") or snap.get("minuteBar") or {}
+            prev_daily   = snap.get("prevDailyBar") or {}
+            latest_trade = snap.get("latestTrade", {})
+            price      = latest_trade.get("p") or daily.get("c", 0)
+            open_price = daily.get("o", price)
+            # Daily change is measured against the PREVIOUS session's close —
+            # at 08:00 ET the market hasn't opened, so comparing against
+            # today's "open" would actually compare against yesterday's.
+            prev_close = prev_daily.get("c") or 0
+            change_pct = ((price - prev_close) / prev_close * 100) if prev_close else 0
+            data[symbol] = {
+                "price":      float(price),
+                "prev_close": float(prev_close),
+                "open":       float(open_price),
+                "high":       float(daily.get("h", 0)),
+                "low":        float(daily.get("l", 0)),
+                "volume":     daily.get("v"),
+                "change_pct": round(change_pct, 2),
+            }
         except Exception as e:
-            logger.warning(f"Polygon fetch failed for {symbol}: {e}")
+            logger.warning(f"Alpaca snapshot fetch failed for {symbol}: {e}")
             data[symbol] = {}
 
     return data
@@ -100,26 +108,30 @@ def fetch_news(symbols: list[str], limit_per_symbol: int = 5) -> list[dict]:
     """
     Fetch recent news headlines from Finnhub for watchlist symbols.
     """
+    from datetime import timedelta
     news_items = []
     headers = {"X-Finnhub-Token": FINNHUB_API_KEY}
+    today      = datetime.now(timezone.utc).date()
+    month_ago  = today - timedelta(days=30)
 
     for symbol in symbols:
         try:
             resp = requests.get(
                 f"{FINNHUB_BASE}/company-news",
-                params={"symbol": symbol, "from": "2024-01-01", "to": "2099-01-01"},
+                params={"symbol": symbol, "from": month_ago.isoformat(), "to": today.isoformat()},
                 headers=headers,
                 timeout=10,
             )
             resp.raise_for_status()
             items = resp.json()[:limit_per_symbol]
             for item in items:
+                # NOTE: Finnhub company-news has no sentiment field — don't
+                # fabricate one, Claude reads the headlines directly.
                 news_items.append({
-                    "symbol":    symbol,
-                    "headline":  item.get("headline", ""),
-                    "summary":   item.get("summary", "")[:200],
-                    "sentiment": item.get("sentiment", "neutral"),
-                    "datetime":  item.get("datetime"),
+                    "symbol":   symbol,
+                    "headline": item.get("headline", ""),
+                    "summary":  item.get("summary", "")[:200],
+                    "datetime": item.get("datetime"),
                 })
         except Exception as e:
             logger.warning(f"Finnhub news fetch failed for {symbol}: {e}")
@@ -229,13 +241,17 @@ def log_alert(
 
 # ── Core daily job ────────────────────────────────────────────────────────────
 
-def morning_job():
+def morning_job(force: bool = False):
     """
     Main daily workflow — runs at 08:00 ET on trading days.
 
+    Args:
+        force: re-run even if a daily report already exists for today
+               (used by the manual dashboard trigger).
+
     Flow:
       1. Load watchlist from DB
-      2. Fetch market data (Polygon) + news (Finnhub)
+      2. Fetch market data (Alpaca) + news (Finnhub)
       3. Halal screen each symbol (Zoya + Claude ratios)
       4. Run Claude analysis → signals
       5. Send Telegram morning brief
@@ -267,16 +283,17 @@ def morning_job():
         # ── Check if already ran today ──
         from datetime import date
         today = datetime.now(timezone.utc).date()
-        existing_report = (
-            db.query(DailyReport)
-            .filter(
-                DailyReport.report_date >= datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+        if not force:
+            existing_report = (
+                db.query(DailyReport)
+                .filter(
+                    DailyReport.report_date >= datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+                )
+                .first()
             )
-            .first()
-        )
-        if existing_report:
-            logger.info(f"Morning job already ran today ({today}) — skipping. Use force=True to override.")
-            return
+            if existing_report:
+                logger.info(f"Morning job already ran today ({today}) — skipping. Use force=True to override.")
+                return
 
         # ── 2. Halal screen FIRST (uses cache — fast) ──
         # Screen before fetching market data so we skip API calls for non-compliant stocks.
@@ -498,6 +515,110 @@ def weekly_refresh_halal_cache():
         db.close()
 
 
+def reconcile_trade_fills() -> dict:
+    """
+    Fix Trade rows that were logged before their Alpaca orders filled (price=0).
+
+    - If the order filled: record the real fill price, quantity, and time.
+    - If the order was canceled/expired/rejected: delete the row — the trade
+      never happened and must not pollute the tax records.
+    - Otherwise leave it pending for the next run.
+
+    Runs at 16:45 ET after the close; also triggerable via POST /api/trades/reconcile.
+    """
+    from datetime import timedelta
+    from db.models import Trade
+
+    db = get_db()
+    updated = removed = still_pending = checked = 0
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+        pending = (
+            db.query(Trade)
+            .filter(
+                Trade.price == 0,
+                Trade.traded_at >= cutoff,
+                Trade.alpaca_order_id.isnot(None),
+            )
+            .all()
+        )
+        checked = len(pending)
+        for trade in pending:
+            try:
+                resp = requests.get(
+                    f"{ALPACA_BASE_URL}/v2/orders/{trade.alpaca_order_id}",
+                    headers={
+                        "APCA-API-KEY-ID":     ALPACA_KEY,
+                        "APCA-API-SECRET-KEY": ALPACA_SECRET,
+                    },
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                order = resp.json()
+            except Exception as e:
+                logger.warning(f"Reconcile: order lookup failed for {trade.alpaca_order_id}: {e}")
+                still_pending += 1
+                continue
+
+            filled_price = float(order.get("filled_avg_price") or 0)
+            order_status = order.get("status", "")
+
+            if filled_price > 0:
+                filled_qty        = float(order.get("filled_qty") or 0) or float(trade.quantity)
+                trade.price       = filled_price
+                trade.quantity    = filled_qty
+                trade.total_value = filled_price * filled_qty
+                if order.get("filled_at"):
+                    try:
+                        trade.traded_at = datetime.fromisoformat(
+                            order["filled_at"].replace("Z", "+00:00")
+                        )
+                    except ValueError:
+                        pass
+                updated += 1
+                logger.info(f"Reconciled fill: {trade.symbol} {filled_qty} @ {filled_price}")
+            elif order_status in ("canceled", "expired", "rejected"):
+                logger.info(f"Reconcile: removing {order_status} order {trade.alpaca_order_id} ({trade.symbol})")
+                db.delete(trade)
+                removed += 1
+            else:
+                still_pending += 1
+
+        db.commit()
+        logger.info(
+            f"Trade reconcile done: {updated} updated, {removed} removed, "
+            f"{still_pending} still pending (of {checked} checked)"
+        )
+        return {
+            "checked":       checked,
+            "updated":       updated,
+            "removed":       removed,
+            "still_pending": still_pending,
+        }
+    except Exception as e:
+        logger.error(f"Trade reconcile failed: {e}", exc_info=True)
+        return {"error": str(e), "checked": checked, "updated": updated, "removed": removed}
+    finally:
+        db.close()
+
+
+def signal_performance_job():
+    """
+    Nightly: fill in 1w/1m/3m forward returns (and SPUS benchmark returns)
+    for past signals. This is the data behind /api/performance/summary.
+    """
+    logger.info("Signal performance update starting...")
+    db = get_db()
+    try:
+        import performance as performance_module
+        result = performance_module.update_signal_performance(db)
+        logger.info(f"Signal performance update done: {result}")
+    except Exception as e:
+        logger.error(f"Signal performance update failed: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
 # ── Scheduler setup ───────────────────────────────────────────────────────────
 
 def create_scheduler() -> BlockingScheduler:
@@ -530,6 +651,36 @@ def create_scheduler() -> BlockingScheduler:
         ),
         id="halal_cache_refresh",
         name="Weekly halal cache refresh",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Trade fill reconcile — weekdays at 16:45 ET (after the close)
+    scheduler.add_job(
+        reconcile_trade_fills,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=16,
+            minute=45,
+            timezone="America/New_York",
+        ),
+        id="trade_reconcile",
+        name="Reconcile trade fills",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Signal performance update — weekdays at 17:30 ET
+    scheduler.add_job(
+        signal_performance_job,
+        trigger=CronTrigger(
+            day_of_week="mon-fri",
+            hour=17,
+            minute=30,
+            timezone="America/New_York",
+        ),
+        id="signal_performance",
+        name="Signal forward-return update",
         max_instances=1,
         coalesce=True,
     )

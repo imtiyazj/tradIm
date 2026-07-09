@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import { authFetch } from "@/lib/api";
 
 interface TaxSummary {
   short_term_gains:number; long_term_gains:number; quarterly_estimate:number;
@@ -17,7 +18,7 @@ export default function TaxPage() {
 
   const loadTax = () => {
     setLoading(true);
-    fetch(`${process.env.NEXT_PUBLIC_API_URL||"http://localhost:8000"}/api/tax/summary?year=${year}`)
+    authFetch(`${process.env.NEXT_PUBLIC_API_URL||"http://localhost:8000"}/api/tax/summary?year=${year}`)
       .then(r=>r.json()).then(data=>{ setSummary(data.summary); setCount(data.trade_count); setLoaded(true); })
       .catch(console.error).finally(()=>setLoading(false));
   };

@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import { authFetch } from "@/lib/api";
 
 interface DiscoveryPick {
   symbol:           string;
@@ -48,7 +49,7 @@ function TradeModal({ symbol, price, side, confidence, onClose, showToast }: Tra
   useEffect(() => {
     if (!isBuy || confidence == null || confidence < 0.65) return;
     setLoadingSize(true);
-    fetch(`${API_URL}/api/trade/size?symbol=${symbol}&confidence=${confidence}`)
+    authFetch(`${API_URL}/api/trade/size?symbol=${symbol}&confidence=${confidence}`)
       .then(r => r.json())
       .then((data: SizeInfo & { detail?: string }) => {
         if (!data.detail && data.shares > 0) {
@@ -65,7 +66,7 @@ function TradeModal({ symbol, price, side, confidence, onClose, showToast }: Tra
     if (!parsedQty || parsedQty <= 0) { showToast("Enter a valid quantity"); return; }
     setLoading(true);
     try {
-      const res = await fetch(`${API_URL}/api/trade`, {
+      const res = await authFetch(`${API_URL}/api/trade`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({
@@ -217,7 +218,7 @@ export default function DiscoverPage() {
         ? `${API_URL}/api/discover/refresh?top_n=${topN}`
         : `${API_URL}/api/discover?top_n=${topN}`;
       const method = forceRefresh ? "POST" : "GET";
-      const res = await fetch(url, { method });
+      const res = await authFetch(url, { method });
       if (!res.ok) throw new Error(`API error ${res.status}`);
       const data = await res.json();
       setResult(data);
@@ -492,7 +493,7 @@ const HALAL_UNIVERSE_COUNT = 100;
 
 async function addToWatchlist(symbol: string, showToast: (msg: string) => void) {
   try {
-    const res = await fetch(`${API_URL}/api/watchlist`, {
+    const res = await authFetch(`${API_URL}/api/watchlist`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ symbol }),

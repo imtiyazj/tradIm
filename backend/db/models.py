@@ -13,7 +13,7 @@ import enum
 import os
 
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
 
 
 class Base(DeclarativeBase):
@@ -209,6 +209,46 @@ class DailyReport(Base):
 
     def __repr__(self):
         return f"<DailyReport {self.report_date.date()}>"
+
+
+class SignalPerformance(Base):
+    """
+    Forward returns for each signal — the feedback loop that tells us whether
+    Claude's signals (and their confidence scores) actually predict anything.
+
+    One row per signal. Horizons are filled in as they become measurable
+    (1w after ~7 calendar days, etc.) by the nightly performance job.
+    bench_* columns hold the SPUS (halal S&P 500 ETF) return over the same
+    window, so alpha = return_X - bench_return_X.
+    """
+    __tablename__ = "signal_performance"
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    signal_id       = Column(UUID(as_uuid=True), ForeignKey("signals.id", ondelete="CASCADE"),
+                             nullable=False, unique=True, index=True)
+    # Copied from the signal for cheap aggregate queries
+    symbol          = Column(String(20), nullable=False, index=True)
+    signal_type     = Column(String(50), nullable=False)
+    confidence      = Column(Numeric(4, 3), nullable=True)
+    price_at        = Column(Numeric(18, 4), nullable=False)
+    triggered_at    = Column(DateTime(timezone=True), nullable=False)
+    # Forward returns in percent (e.g. 4.2 = +4.2%); NULL until measurable
+    return_1w       = Column(Numeric(10, 4), nullable=True)
+    return_1m       = Column(Numeric(10, 4), nullable=True)
+    return_3m       = Column(Numeric(10, 4), nullable=True)
+    bench_return_1w = Column(Numeric(10, 4), nullable=True)
+    bench_return_1m = Column(Numeric(10, 4), nullable=True)
+    bench_return_3m = Column(Numeric(10, 4), nullable=True)
+    updated_at      = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    signal = relationship("Signal")
+
+    __table_args__ = (
+        Index("ix_signal_perf_type_conf", "signal_type", "confidence"),
+    )
+
+    def __repr__(self):
+        return f"<SignalPerformance {self.symbol} {self.signal_type} 1m={self.return_1m}>"
 
 
 # ── Database engine helpers ───────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
-import { api, Signal } from "@/lib/api";
+import { api, authFetch, Signal } from "@/lib/api";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -58,7 +58,7 @@ function ExecuteModal({ signal, onClose, showToast }: ExecuteModalProps) {
     }
     setLoadingSize(true);
     setSizeErr("");
-    fetch(`${API_URL}/api/trade/size?symbol=${signal.symbol}&confidence=${confidence}`)
+    authFetch(`${API_URL}/api/trade/size?symbol=${signal.symbol}&confidence=${confidence}`)
       .then(r => r.json())
       .then(data => {
         if (data.detail) { setSizeErr(data.detail); }
@@ -72,7 +72,7 @@ function ExecuteModal({ signal, onClose, showToast }: ExecuteModalProps) {
     if (!sizeInfo) return;
     setPlacing(true);
     try {
-      const res = await fetch(`${API_URL}/api/trade`, {
+      const res = await authFetch(`${API_URL}/api/trade`, {
         method:  "POST",
         headers: { "Content-Type": "application/json" },
         body:    JSON.stringify({
@@ -232,12 +232,18 @@ export default function SignalsPage() {
     const symbols = Array.from(new Set(signals.map(s => s.symbol)));
     symbols.forEach(async sym => {
       try {
-        const r = await fetch(`${API_URL}/api/technicals/${sym}`);
-        if (r.ok) setTechMap(prev => ({ ...prev, [sym]: await r.json() }));
+        const r = await authFetch(`${API_URL}/api/technicals/${sym}`);
+        if (r.ok) {
+          const data = await r.json();
+          setTechMap(prev => ({ ...prev, [sym]: data }));
+        }
       } catch {}
       try {
-        const r = await fetch(`${API_URL}/api/earnings/${sym}`);
-        if (r.ok) setEarningsMap(prev => ({ ...prev, [sym]: await r.json() }));
+        const r = await authFetch(`${API_URL}/api/earnings/${sym}`);
+        if (r.ok) {
+          const data = await r.json();
+          setEarningsMap(prev => ({ ...prev, [sym]: data }));
+        }
       } catch {}
     });
   }, [signals]);

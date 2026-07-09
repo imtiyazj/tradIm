@@ -10,12 +10,14 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import logging
+import math
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 import requests
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session, sessionmaker
@@ -28,6 +30,7 @@ from db.models import (
 import halal_screen as halal_module
 import claude as claude_module
 import risk as risk_module
+import auth as auth_module
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 
@@ -68,13 +71,22 @@ def get_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting Halal Trader API...")
+    if not auth_module.auth_enabled():
+        logger.critical(
+            "CLERK_ISSUER is not set — API AUTHENTICATION IS DISABLED. "
+            "Anyone who can reach this server can place trades. "
+            "Set CLERK_ISSUER to your Clerk Frontend API URL before deploying."
+        )
     create_tables()
     logger.info("Database tables ready.")
 
     # Start the background scheduler (cron jobs)
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.cron import CronTrigger
-    from scheduler.jobs import morning_job, weekly_refresh_halal_cache
+    from scheduler.jobs import (
+        morning_job, weekly_refresh_halal_cache,
+        reconcile_trade_fills, signal_performance_job,
+    )
 
     scheduler = BackgroundScheduler(timezone="America/New_York")
     scheduler.add_job(
@@ -91,6 +103,22 @@ async def lifespan(app: FastAPI):
         trigger=CronTrigger(day_of_week="sun", hour=6, minute=0, timezone="America/New_York"),
         id="halal_cache_refresh",
         name="Weekly halal cache refresh",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        reconcile_trade_fills,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=16, minute=45, timezone="America/New_York"),
+        id="trade_reconcile",
+        name="Reconcile trade fills",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        signal_performance_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=30, timezone="America/New_York"),
+        id="signal_performance",
+        name="Signal forward-return update",
         max_instances=1,
         coalesce=True,
     )
@@ -116,6 +144,11 @@ app = FastAPI(
     redoc_url=None,
 )
 
+# NOTE: middleware order matters — the LAST middleware added runs FIRST.
+# Auth is added before CORS so CORS ends up outermost: preflights and 401s
+# still get proper CORS headers in the browser.
+app.add_middleware(auth_module.ClerkAuthMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -126,6 +159,11 @@ app.add_middleware(
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
+
+class UserSyncRequest(BaseModel):
+    clerk_id: str
+    email: str
+
 
 class WatchlistAddRequest(BaseModel):
     symbol: str
@@ -152,6 +190,38 @@ def health_check():
         "timestamp":   datetime.now(timezone.utc).isoformat(),
         "alpaca_mode": "paper" if "paper" in ALPACA_BASE_URL else "live",
     }
+
+
+# ── Auth / user sync ─────────────────────────────────────────────────────────
+
+@app.post("/api/auth/sync", tags=["system"])
+def sync_user(body: UserSyncRequest, request: Request, db: Session = Depends(get_db)):
+    """
+    Called by the frontend after Clerk sign-in to ensure a matching User row
+    exists in the database. Safe to call multiple times (upsert behaviour).
+
+    The clerk_id is bound to the VERIFIED token subject — a client cannot
+    sync as someone else by sending a different id in the body.
+    """
+    from db.models import User
+
+    claims = getattr(request.state, "clerk", None)
+    if claims is not None and body.clerk_id != claims.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="clerk_id does not match the authenticated session.",
+        )
+
+    user = db.query(User).filter(User.clerk_id == body.clerk_id).first()
+    created = False
+    if not user:
+        user = User(email=body.email, clerk_id=body.clerk_id)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        created = True
+        logger.info(f"Created new user: {body.email}")
+    return {"id": str(user.id), "email": user.email, "created": created}
 
 
 # ── Watchlist ─────────────────────────────────────────────────────────────────
@@ -400,11 +470,16 @@ def get_tax_summary(year: int = datetime.now().year, db: Session = Depends(get_d
 # ── Manual scheduler trigger ──────────────────────────────────────────────────
 
 @app.post("/api/scheduler/run", tags=["system"])
-def trigger_morning_job():
+def trigger_morning_job(force: bool = True):
+    """
+    Manually trigger the morning job. Defaults to force=True so the
+    dashboard button re-runs analysis even if the scheduled 08:00 run
+    already produced a report today.
+    """
     import threading
     from scheduler.jobs import morning_job
 
-    thread = threading.Thread(target=morning_job, daemon=True)
+    thread = threading.Thread(target=morning_job, kwargs={"force": force}, daemon=True)
     thread.start()
     return {"message": "Morning job triggered. Check Telegram for updates."}
 
@@ -522,6 +597,36 @@ def _fetch_alpaca_price(symbol: str) -> float:
     return float(price)
 
 
+def _poll_order_fill(order_id: str, attempts: int = 5, delay: float = 0.8) -> dict:
+    """
+    Poll Alpaca for an order's fill after submission. Market orders during
+    trading hours usually fill in under a second; orders placed outside
+    hours stay 'accepted' until the next open — those keep price=0 in the
+    Trade table and are corrected by the reconcile job after the close.
+
+    Returns the latest order dict (may still be unfilled).
+    """
+    order: dict = {}
+    for _ in range(attempts):
+        time.sleep(delay)
+        try:
+            resp = requests.get(
+                f"{ALPACA_BASE_URL}/v2/orders/{order_id}",
+                headers={
+                    "APCA-API-KEY-ID":     ALPACA_KEY,
+                    "APCA-API-SECRET-KEY": ALPACA_SECRET,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            order = resp.json()
+            if order.get("filled_avg_price"):
+                return order
+        except Exception as e:
+            logger.warning(f"Order fill poll failed for {order_id}: {e}")
+    return order
+
+
 # ── Paper trading ─────────────────────────────────────────────────────────────
 
 class TradeRequest(BaseModel):
@@ -558,6 +663,9 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
     """
     Place a paper (or live) market order via Alpaca.
     Supports auto-sizing by confidence and bracket orders with stop-loss + take-profit.
+
+    Buys are halal-gated: NON_COMPLIANT symbols are refused outright.
+    Sells are never blocked (divesting a non-compliant holding must always work).
     """
     if not ALPACA_KEY or not ALPACA_SECRET:
         raise HTTPException(status_code=503, detail="Alpaca credentials not configured")
@@ -567,7 +675,31 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
     portfolio_pct = None
     sl_price      = None
     tp_price      = None
+    use_bracket   = req.use_bracket
     is_paper      = "paper" in ALPACA_BASE_URL
+    warnings: list[str] = []
+
+    # ── Halal gate (buys only) ────────────────────────────────────────────────
+    # screen_stock is cache-backed, so this is normally instant.
+    halal_status = HalalStatus.UNKNOWN
+    try:
+        screen = halal_module.screen_stock(req.symbol, db)
+        halal_status = screen.get("final_status") or HalalStatus.UNKNOWN
+    except Exception as e:
+        logger.warning(f"Halal screen failed for {req.symbol} during trade: {e}")
+
+    if req.side == "buy":
+        if halal_status == HalalStatus.NON_COMPLIANT:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"{req.symbol} is not Shariah-compliant — buy refused. "
+                       f"Reason: {screen.get('notes', 'failed Shariah screening')}",
+            )
+        if halal_status in (HalalStatus.DOUBTFUL, HalalStatus.UNKNOWN):
+            warnings.append(
+                f"Halal status of {req.symbol} is {halal_status.value} — "
+                f"verify before holding long-term."
+            )
 
     try:
         # ── Auto-sizing ──────────────────────────────────────────────────────
@@ -599,14 +731,42 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
                 )
 
         # ── Fetch price for bracket order (if not already fetched) ───────────
-        if req.use_bracket and req.side == "buy" and current_price <= 0:
+        if use_bracket and req.side == "buy" and current_price <= 0:
             try:
                 current_price = _fetch_alpaca_price(req.symbol)
             except Exception as e:
                 logger.warning(f"Could not fetch price for bracket; falling back to market-only: {e}")
 
+        # Bracket only possible with a price for the stop/limit legs
+        if use_bracket and req.side == "buy" and current_price <= 0:
+            use_bracket = False
+            warnings.append(
+                "Could not fetch a live price — placed as a simple market "
+                "order without stop-loss/take-profit."
+            )
+
+        # ── Bracket orders require whole shares on Alpaca ─────────────────────
+        # Fractional quantities are only accepted on simple orders, so round
+        # down; if that leaves less than 1 share, drop the bracket instead of
+        # dropping the trade.
+        if use_bracket and req.side == "buy":
+            whole_qty = math.floor(qty)
+            if whole_qty >= 1:
+                if whole_qty != qty:
+                    warnings.append(
+                        f"Quantity rounded down {qty} → {whole_qty} shares "
+                        f"(Alpaca bracket orders require whole shares)."
+                    )
+                qty = float(whole_qty)
+            else:
+                use_bracket = False
+                warnings.append(
+                    "Position sizes to less than 1 share — placed as a simple "
+                    "fractional order without stop-loss/take-profit."
+                )
+
         # ── Build order payload ──────────────────────────────────────────────
-        if req.use_bracket and req.side == "buy" and current_price > 0:
+        if use_bracket and req.side == "buy":
             sl_price = risk_module.stop_loss_price(current_price)
             tp_price = risk_module.take_profit_price(current_price)
             payload = {
@@ -620,6 +780,8 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
                 "take_profit":   {"limit_price": str(tp_price)},
             }
         else:
+            sl_price = None
+            tp_price = None
             payload = {
                 "symbol":        req.symbol,
                 "qty":           str(qty),
@@ -639,21 +801,35 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
         )
         resp.raise_for_status()
         order = resp.json()
-        logger.info(f"Order placed: {req.side} {qty} {req.symbol} id={order.get('id')} bracket={req.use_bracket and req.side == 'buy'}")
+        logger.info(f"Order placed: {req.side} {qty} {req.symbol} id={order.get('id')} bracket={use_bracket and req.side == 'buy'}")
+
+        # ── Wait briefly for the fill so we log the real execution price ─────
+        # Market orders during trading hours fill almost instantly. If the
+        # order doesn't fill (e.g. placed outside market hours), we record
+        # price=0 and the reconcile job fixes it after the close — never
+        # log a guessed price as if it were the actual fill.
+        filled = _poll_order_fill(order.get("id")) or order
+        filled_price = float(filled.get("filled_avg_price") or 0)
+        filled_qty   = float(filled.get("filled_qty") or 0) or qty
+        fill_pending = filled_price <= 0
+        if fill_pending:
+            warnings.append(
+                "Order not filled yet (market likely closed) — fill price "
+                "will be recorded by the end-of-day reconcile job."
+            )
 
         # Log to Trade table
         from db.models import Trade, TradeSide
-        user_id      = _get_default_user_id(db)
-        filled_price = float(order.get("filled_avg_price") or 0)
+        user_id = _get_default_user_id(db)
         trade = Trade(
             user_id         = user_id,
             alpaca_order_id = order.get("id"),
             symbol          = req.symbol,
             side            = TradeSide.BUY if req.side == "buy" else TradeSide.SELL,
-            quantity        = qty,
+            quantity        = filled_qty,
             price           = filled_price,
-            total_value     = filled_price * qty,
-            halal_status    = "compliant",
+            total_value     = filled_price * filled_qty,
+            halal_status    = halal_status,
             is_paper        = is_paper,
             traded_at       = datetime.now(timezone.utc),
         )
@@ -665,11 +841,15 @@ def place_trade(req: TradeRequest, db: Session = Depends(get_db)):
             "order_id":        order.get("id"),
             "symbol":          req.symbol,
             "side":            req.side,
-            "qty":             qty,
-            "status":          order.get("status"),
+            "qty":             filled_qty,
+            "status":          filled.get("status", order.get("status")),
+            "filled_price":    filled_price if not fill_pending else None,
+            "fill_pending":    fill_pending,
+            "halal_status":    halal_status.value if hasattr(halal_status, "value") else str(halal_status),
             "stop_loss_price": sl_price,
             "take_profit_price": tp_price,
             "portfolio_pct":   portfolio_pct,
+            "warnings":        warnings,
             "paper":           is_paper,
         }
     except HTTPException:
@@ -726,6 +906,45 @@ def get_trade_size(symbol: str, confidence: float):
     except Exception as e:
         logger.error(f"Trade size error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/trades/reconcile", tags=["trading"])
+def reconcile_trades():
+    """
+    Re-fetch fill data from Alpaca for recent trades that were logged before
+    their orders filled (price=0). Runs automatically after the close; this
+    endpoint triggers it manually.
+    """
+    from scheduler.jobs import reconcile_trade_fills
+    result = reconcile_trade_fills()
+    return result
+
+
+# ── Signal performance ────────────────────────────────────────────────────────
+
+@app.get("/api/performance/summary", tags=["performance"])
+def get_performance_summary(db: Session = Depends(get_db)):
+    """
+    Hit-rates, average forward returns, and alpha vs SPUS — grouped by
+    signal type and confidence bucket. The honest answer to "do the
+    signals actually work?"
+    """
+    import performance as performance_module
+    return performance_module.performance_summary(db)
+
+
+@app.get("/api/performance/signals", tags=["performance"])
+def get_performance_signals(limit: int = 50, db: Session = Depends(get_db)):
+    """Most recent tracked signals with their measured forward returns."""
+    import performance as performance_module
+    return performance_module.recent_performance(db, limit=limit)
+
+
+@app.post("/api/performance/update", tags=["performance"])
+def trigger_performance_update(db: Session = Depends(get_db)):
+    """Manually run the forward-return update (normally nightly at 17:30 ET)."""
+    import performance as performance_module
+    return performance_module.update_signal_performance(db)
 
 
 # ── Technicals + Earnings ─────────────────────────────────────────────────────
