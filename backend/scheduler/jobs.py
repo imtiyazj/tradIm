@@ -43,6 +43,14 @@ ALPACA_BASE_URL  = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.m
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# Railway injects RAILWAY_ENVIRONMENT_NAME (production / staging); override with TELEGRAM_PREFIX.
+_ENV_LABELS = {"production": "PROD", "staging": "STAGING"}
+_ENV_NAME = os.environ.get("RAILWAY_ENVIRONMENT_NAME", "local")
+TELEGRAM_PREFIX = os.environ.get(
+    "TELEGRAM_PREFIX",
+    f"[{_ENV_LABELS.get(_ENV_NAME, _ENV_NAME.upper())}]",
+)
+
 ALPACA_DATA_URL = "https://data.alpaca.markets"
 FINNHUB_BASE    = "https://finnhub.io/api/v1"
 
@@ -200,14 +208,14 @@ def place_alpaca_order(symbol: str, qty: float, side: str) -> Optional[dict]:
 # ── Alert senders ─────────────────────────────────────────────────────────────
 
 def send_telegram(message: str) -> bool:
-    """Send a message to the configured Telegram chat."""
+    """Send a message to the configured Telegram chat, prefixed with the environment."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured — skipping alert")
         return False
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": f"{TELEGRAM_PREFIX} {message}"},
             timeout=10,
         )
         resp.raise_for_status()
@@ -698,7 +706,7 @@ if __name__ == "__main__":
 
     # List scheduled jobs on startup
     for job in scheduler.get_jobs():
-        logger.info(f"  Scheduled: {job.name} — next run: {job.next_run_time}")
+        logger.info(f"  Scheduled: {job.name} — next run: {getattr(job, 'next_run_time', None)}")
 
     try:
         scheduler.start()
