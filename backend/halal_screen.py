@@ -349,9 +349,11 @@ def screen_stock(symbol: str, db: Session, force_refresh: bool = False) -> dict:
                 "zoya_status":         cached.zoya_status,
                 "final_status":        cached.final_status,
                 "sector":              cached.sector,
-                "debt_ratio":          float(cached.debt_ratio) if cached.debt_ratio else None,
-                "interest_income_pct": float(cached.interest_income_pct) if cached.interest_income_pct else None,
-                "haram_revenue_pct":   float(cached.haram_revenue_pct) if cached.haram_revenue_pct else None,
+                # `is not None`, not truthiness: a genuine 0% (e.g. no haram
+                # revenue) must survive the cache — purification relies on it.
+                "debt_ratio":          float(cached.debt_ratio) if cached.debt_ratio is not None else None,
+                "interest_income_pct": float(cached.interest_income_pct) if cached.interest_income_pct is not None else None,
+                "haram_revenue_pct":   float(cached.haram_revenue_pct) if cached.haram_revenue_pct is not None else None,
                 "ratio_pass":          cached.ratio_pass,
                 "notes":               cached.notes,
                 "from_cache":          True,

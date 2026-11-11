@@ -9,6 +9,12 @@ FastAPI backend + Next.js dashboard, deployed on Railway.
   and bracket orders; buys are halal-gated at the API level
 - **Feedback loop**: nightly forward-return tracking per signal vs SPUS benchmark
   (`/dashboard/performance`)
+- **Compliance review**: quarterly forced re-screen of every holding with a
+  permanent audit trail and alerts on holdings that became non-compliant —
+  alert only, nothing is sold automatically (`/dashboard/compliance`)
+- **Purification**: ledger of the impermissible share of each dividend
+  (dividend × haram-revenue share; 5% ceiling when the share is unknown),
+  with donated/outstanding tracking
 
 ## Backend environment variables
 
@@ -40,6 +46,8 @@ FastAPI backend + Next.js dashboard, deployed on Railway.
 | 16:45 | Reconcile trade fills (fixes price=0 rows from unfilled orders) |
 | 17:30 | Signal forward-return update (1w/1m/3m vs SPUS) |
 | Sun 06:00 | Halal cache refresh |
+| Sat 07:00 | Purification sync — new Alpaca dividends into the ledger |
+| 07:00, 1st–7th of Mar/Jun/Sep/Dec | Quarterly compliance review (runs once per quarter; later days are retries) |
 
 ## Local development
 

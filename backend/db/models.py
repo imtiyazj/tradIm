@@ -251,6 +251,81 @@ class SignalPerformance(Base):
         return f"<SignalPerformance {self.symbol} {self.signal_type} 1m={self.return_1m}>"
 
 
+class ComplianceCheck(Base):
+    """
+    Audit trail of the quarterly Shariah compliance review.
+
+    One row per symbol per review run. Unlike halal_screen_results (a cache
+    that is overwritten in spirit every week), these rows are never expired:
+    they record what each holding's status was at each review and whether it
+    changed since the previous one.
+    """
+    __tablename__ = "compliance_checks"
+
+    id                = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id           = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # All rows written by one review share a run_id
+    run_id            = Column(UUID(as_uuid=True), nullable=False, index=True)
+    period            = Column(String(10), nullable=False, index=True)   # e.g. "2026-Q4"
+    symbol            = Column(String(20), nullable=False, index=True)
+    previous_status   = Column(Enum(HalalStatus), nullable=True)         # NULL = first time reviewed
+    new_status        = Column(Enum(HalalStatus), nullable=False)
+    status_changed    = Column(Boolean, default=False, nullable=False)
+    # True when the screen could not reach a verdict (Zoya down, UNKNOWN) —
+    # such rows never count as a status change.
+    inconclusive      = Column(Boolean, default=False, nullable=False)
+    is_held           = Column(Boolean, default=False, nullable=False)   # open position at review time
+    quantity          = Column(Numeric(18, 8), nullable=True)
+    market_value      = Column(Numeric(18, 4), nullable=True)
+    debt_ratio        = Column(Numeric(8, 4), nullable=True)
+    haram_revenue_pct = Column(Numeric(8, 4), nullable=True)
+    notes             = Column(Text, nullable=True)
+    checked_at        = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_compliance_symbol_checked", "symbol", "checked_at"),
+    )
+
+    def __repr__(self):
+        return f"<ComplianceCheck {self.period} {self.symbol}: {self.new_status}>"
+
+
+class PurificationEntry(Base):
+    """
+    Dividend purification ledger.
+
+    One row per dividend received. purification_amount is the share of the
+    dividend attributable to impermissible income (income_amount * impure_pct)
+    that should be given to charity. is_paid tracks whether it has been donated.
+    """
+    __tablename__ = "purification_entries"
+
+    id                  = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id             = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    symbol              = Column(String(20), nullable=False, index=True)
+    # Alpaca account-activity id — makes the dividend sync idempotent
+    alpaca_activity_id  = Column(String(100), unique=True, nullable=True, index=True)
+    income_date         = Column(DateTime(timezone=True), nullable=False)
+    income_amount       = Column(Numeric(18, 4), nullable=False)
+    impure_pct          = Column(Numeric(8, 4), nullable=False)    # fraction, e.g. 0.0210 = 2.1%
+    # "screen" = haram-revenue share from the halal screen;
+    # "default_cap" = share unknown, 5% compliance ceiling used as an upper bound
+    rate_source         = Column(String(20), nullable=False)
+    purification_amount = Column(Numeric(18, 4), nullable=False)
+    is_paper            = Column(Boolean, default=True, nullable=False)
+    is_paid             = Column(Boolean, default=False, nullable=False)
+    paid_at             = Column(DateTime(timezone=True), nullable=True)
+    note                = Column(Text, nullable=True)
+    created_at          = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_purification_user_date", "user_id", "income_date"),
+    )
+
+    def __repr__(self):
+        return f"<PurificationEntry {self.symbol} {self.income_amount} -> {self.purification_amount}>"
+
+
 # ── Database engine helpers ───────────────────────────────────────────────────
 
 def get_engine():

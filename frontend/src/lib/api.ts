@@ -45,6 +45,12 @@ export interface HorizonStats { n: number; avg_return: number; win_rate: number;
 export interface PerformanceGroup { "1w": HorizonStats | null; "1m": HorizonStats | null; "3m": HorizonStats | null; }
 export interface PerformanceSummary { total_tracked: number; benchmark: string; overall: PerformanceGroup; by_type: Record<string, PerformanceGroup>; by_confidence: Record<string, PerformanceGroup>; }
 export interface PerformanceSignal { symbol: string; type: string; confidence: number | null; price_at: number | null; triggered_at: string; return_1w: number | null; return_1m: number | null; return_3m: number | null; alpha_1m: number | null; }
+export interface ComplianceCheck { id: string; period: string; symbol: string; previous_status: string | null; new_status: string; status_changed: boolean; inconclusive: boolean; is_held: boolean; quantity: number | null; market_value: number | null; debt_ratio: number | null; haram_revenue_pct: number | null; notes: string | null; checked_at: string; }
+export interface ComplianceReview { run_id: string; period: string; checked_at: string; checked: number; held: number; action_required: ComplianceCheck[]; review: ComplianceCheck[]; changed: ComplianceCheck[]; inconclusive: string[]; rows: ComplianceCheck[]; }
+export interface ComplianceLatest { review: ComplianceReview | null; changes: ComplianceCheck[]; }
+export interface PurificationEntry { id: string; symbol: string; income_date: string; income_amount: number; impure_pct: number; rate_source: string; purification_amount: number; is_paid: boolean; paid_at: string | null; note: string | null; }
+export interface PurificationYear { year: number; dividends: number; owed: number; paid: number; outstanding: number; }
+export interface PurificationSummary { paper: boolean; total_dividends: number; total_owed: number; total_paid: number; outstanding: number; estimated_count: number; by_year: PurificationYear[]; entries: PurificationEntry[]; }
 
 export const api = {
   health: () => apiFetch<HealthResponse>("/health"),
@@ -72,5 +78,15 @@ export const api = {
     summary: () => apiFetch<PerformanceSummary>("/api/performance/summary"),
     signals: (limit = 50) => apiFetch<PerformanceSignal[]>(`/api/performance/signals?limit=${limit}`),
     update:  () => apiFetch<{ eligible: number; updated: number; skipped: number }>("/api/performance/update", { method: "POST" }),
+  },
+  compliance: {
+    latest: () => apiFetch<ComplianceLatest>("/api/compliance/latest"),
+    run:    () => apiFetch<{ message: string }>("/api/compliance/run", { method: "POST" }),
+  },
+  purification: {
+    get:         () => apiFetch<PurificationSummary>("/api/purification"),
+    sync:        () => apiFetch<{ fetched: number; added: number; skipped: number; new_purification: number }>("/api/purification/sync", { method: "POST" }),
+    setPaid:     (id: string, isPaid: boolean) => apiFetch<PurificationEntry>(`/api/purification/${id}`, { method: "PATCH", body: JSON.stringify({ is_paid: isPaid }) }),
+    markAllPaid: () => apiFetch<{ marked: number; amount: number }>("/api/purification/mark-all-paid", { method: "POST" }),
   },
 };
