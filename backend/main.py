@@ -86,6 +86,7 @@ async def lifespan(app: FastAPI):
     from scheduler.jobs import (
         morning_job, weekly_refresh_halal_cache,
         reconcile_trade_fills, signal_performance_job,
+        quarterly_compliance_job, purification_sync_job,
     )
 
     scheduler = BackgroundScheduler(timezone="America/New_York")
@@ -119,6 +120,23 @@ async def lifespan(app: FastAPI):
         trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=30, timezone="America/New_York"),
         id="signal_performance",
         name="Signal forward-return update",
+        max_instances=1,
+        coalesce=True,
+    )
+    # No-op once the quarter is reviewed; days 2–7 are retries.
+    scheduler.add_job(
+        quarterly_compliance_job,
+        trigger=CronTrigger(month="3,6,9,12", day="1-7", hour=7, minute=0, timezone="America/New_York"),
+        id="quarterly_compliance",
+        name="Quarterly compliance review",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        purification_sync_job,
+        trigger=CronTrigger(day_of_week="sat", hour=7, minute=0, timezone="America/New_York"),
+        id="purification_sync",
+        name="Purification dividend sync",
         max_instances=1,
         coalesce=True,
     )
@@ -945,6 +963,73 @@ def trigger_performance_update(db: Session = Depends(get_db)):
     """Manually run the forward-return update (normally nightly at 17:30 ET)."""
     import performance as performance_module
     return performance_module.update_signal_performance(db)
+
+
+# ── Compliance review + purification ──────────────────────────────────────────
+
+class PurificationPaidRequest(BaseModel):
+    is_paid: bool
+
+
+@app.get("/api/compliance/latest", tags=["compliance"])
+def get_latest_compliance_review(db: Session = Depends(get_db)):
+    """
+    The most recent quarterly compliance review: every symbol checked, plus
+    the holdings that need action. `review` is null until the first run.
+    """
+    import compliance as compliance_module
+    return {
+        "review":  compliance_module.latest_review(db),
+        "changes": compliance_module.recent_changes(db, limit=50),
+    }
+
+
+@app.post("/api/compliance/run", tags=["compliance"])
+def trigger_compliance_review():
+    """
+    Manually run the compliance review now (normally quarterly). Runs in the
+    background — it force-refreshes every holding's screen, which is slow.
+    """
+    import threading
+    from scheduler.jobs import quarterly_compliance_job
+
+    thread = threading.Thread(target=quarterly_compliance_job, kwargs={"force": True}, daemon=True)
+    thread.start()
+    return {"message": "Compliance review started. Results appear here and on Telegram in a minute or two."}
+
+
+@app.get("/api/purification", tags=["compliance"])
+def get_purification(db: Session = Depends(get_db)):
+    """Purification ledger: dividends received, amount to donate, amount paid."""
+    import compliance as compliance_module
+    return compliance_module.purification_summary(db)
+
+
+@app.post("/api/purification/sync", tags=["compliance"])
+def sync_purification(db: Session = Depends(get_db)):
+    """Pull new dividends from Alpaca into the ledger (normally weekly)."""
+    import compliance as compliance_module
+    result = compliance_module.sync_dividends(db, _get_default_user_id(db))
+    if result.get("error"):
+        raise HTTPException(status_code=503, detail=result["error"])
+    return result
+
+
+@app.post("/api/purification/mark-all-paid", tags=["compliance"])
+def mark_all_purification_paid(db: Session = Depends(get_db)):
+    """Mark every outstanding entry as donated."""
+    import compliance as compliance_module
+    return compliance_module.mark_all_paid(db)
+
+
+@app.patch("/api/purification/{entry_id}", tags=["compliance"])
+def set_purification_paid(entry_id: str, body: PurificationPaidRequest, db: Session = Depends(get_db)):
+    """Mark one ledger entry as donated, or undo it."""
+    import compliance as compliance_module
+    entry = compliance_module.set_entry_paid(db, entry_id, body.is_paid)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="Purification entry not found.")
+    return entry
 
 
 # ── Technicals + Earnings ─────────────────────────────────────────────────────

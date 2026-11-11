@@ -4,7 +4,8 @@ scheduler/jobs.py — Daily automated workflow.
 Schedule:
   08:00 ET  market open prep  — fetch data, screen, analyse, alert
   16:30 ET  market close wrap — log summary, update daily report
-  Weekly    refresh halal cache for watchlist
+  Weekly    refresh halal cache for watchlist; sync dividends for purification
+  Quarterly compliance review of holdings (Mar/Jun/Sep/Dec)
 
 Run this file directly:  python -m scheduler.jobs
 Or import and attach to an existing APScheduler instance.
@@ -627,6 +628,149 @@ def signal_performance_job():
         db.close()
 
 
+def quarterly_compliance_job(force: bool = False):
+    """
+    Quarterly Shariah compliance review + purification update.
+
+    Re-screens every open position and watchlist symbol, records the audit
+    rows, syncs dividends into the purification ledger, and alerts on
+    holdings that are no longer compliant. It never places orders — selling
+    is left to the user.
+
+    Scheduled daily 07:00 ET on the 1st–7th of Mar/Jun/Sep/Dec (by then the
+    previous quarter's 10-Q/10-K filings are in). Only the first successful
+    run in a quarter does anything; the remaining days are retries in case
+    the service was down or Alpaca/Zoya were unreachable.
+
+    Args:
+        force: run even if this quarter was already reviewed (manual trigger).
+    """
+    import compliance as compliance_module
+    from db.models import User
+
+    logger.info("Quarterly compliance review starting...")
+    db = get_db()
+    try:
+        user = db.query(User).first()
+        if not user:
+            logger.warning("Compliance review: no user found — skipping")
+            return
+
+        period = compliance_module.quarter_label(datetime.now(timezone.utc))
+        positions = None
+        if not force:
+            if compliance_module.period_already_reviewed(db, period):
+                logger.info(f"Compliance review for {period} already done — skipping")
+                return
+            positions = compliance_module.fetch_positions()
+            if positions is None:
+                # Reviewing without holdings would miss the point; retry tomorrow.
+                logger.warning("Compliance review: Alpaca unreachable — will retry on the next scheduled day")
+                return
+
+        result = compliance_module.run_compliance_review(db, user.id, positions=positions)
+        if result["checked"] == 0:
+            logger.info("Compliance review: no holdings or watchlist symbols to review")
+            return
+
+        dividends = compliance_module.sync_dividends(db, user.id)
+        ledger    = compliance_module.purification_summary(db)
+
+        # ── One alert per non-compliant holding ──
+        for row in result["action_required"]:
+            sym = row["symbol"]
+            was = f" (was {row['previous_status']})" if row["status_changed"] else ""
+            qty = f"{row['quantity']:g} shares" if row["quantity"] is not None else "a position"
+            val = f" (${row['market_value']:,.2f})" if row["market_value"] is not None else ""
+            msg = (
+                f"⚠️ COMPLIANCE REVIEW {period} — {sym}\n"
+                f"You hold {qty}{val} and {sym} is NON-COMPLIANT{was}.\n"
+                f"Reason: {row.get('notes') or 'failed Shariah screening'}\n"
+                f"Action: sell the position from the dashboard. Nothing was sold automatically."
+            )
+            sent = send_telegram(msg)
+            log_alert(
+                db, user.id,
+                AlertType.HALAL_CHANGE, AlertChannel.TELEGRAM,
+                msg, symbol=sym, sent_ok=sent,
+            )
+
+        # ── Summary ──
+        lines = [
+            f"HALAL TRADER — Quarterly compliance review {period}",
+            f"Checked: {result['checked']} ({result['held']} held)",
+            f"Action required: {len(result['action_required'])} | "
+            f"Doubtful holdings: {len(result['review'])} | "
+            f"Status changes: {len(result['changed'])}",
+        ]
+        if result["changed"]:
+            lines.append("Changes: " + ", ".join(
+                f"{r['symbol']} {r['previous_status']} → {r['new_status']}"
+                for r in result["changed"]
+            ))
+        if result["review"]:
+            lines.append("Doubtful holdings: " + ", ".join(r["symbol"] for r in result["review"]))
+        if result["inconclusive"]:
+            lines.append(
+                "Could not verify (retry from the dashboard): "
+                + ", ".join(result["inconclusive"])
+            )
+        if result.get("positions_unavailable"):
+            lines.append("Alpaca positions were unavailable — only the watchlist was reviewed.")
+        if dividends.get("error"):
+            lines.append("Purification: dividend sync failed — ledger not updated.")
+        else:
+            lines.append(
+                f"Purification: ${ledger['outstanding']:,.2f} outstanding "
+                f"({dividends['added']} new dividend(s) recorded)"
+            )
+        summary_msg = "\n".join(lines)
+        sent = send_telegram(summary_msg)
+        log_alert(
+            db, user.id,
+            AlertType.HALAL_CHANGE, AlertChannel.TELEGRAM,
+            summary_msg, sent_ok=sent,
+        )
+        logger.info("Quarterly compliance review completed")
+
+    except Exception as e:
+        logger.error(f"Quarterly compliance review FAILED: {e}", exc_info=True)
+        send_telegram(f"HALAL TRADER ERROR: Quarterly compliance review failed.\n{str(e)[:200]}")
+    finally:
+        db.close()
+
+
+def purification_sync_job():
+    """
+    Weekly: pull new dividends from Alpaca into the purification ledger so
+    the amount owed stays current between quarterly reviews.
+    """
+    import compliance as compliance_module
+    from db.models import User
+
+    logger.info("Purification sync starting...")
+    db = get_db()
+    try:
+        user = db.query(User).first()
+        if not user:
+            logger.warning("Purification sync: no user found — skipping")
+            return
+        result = compliance_module.sync_dividends(db, user.id)
+        logger.info(f"Purification sync done: {result}")
+        if result.get("added"):
+            ledger = compliance_module.purification_summary(db)
+            send_telegram(
+                f"HALAL TRADER — Purification\n"
+                f"{result['added']} new dividend(s) recorded, "
+                f"${result['new_purification']:,.2f} to purify.\n"
+                f"Outstanding: ${ledger['outstanding']:,.2f}"
+            )
+    except Exception as e:
+        logger.error(f"Purification sync failed: {e}", exc_info=True)
+    finally:
+        db.close()
+
+
 # ── Scheduler setup ───────────────────────────────────────────────────────────
 
 def create_scheduler() -> BlockingScheduler:
@@ -689,6 +833,38 @@ def create_scheduler() -> BlockingScheduler:
         ),
         id="signal_performance",
         name="Signal forward-return update",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Quarterly compliance review — 07:00 ET on the 1st–7th of Mar/Jun/Sep/Dec.
+    # The job is a no-op once the quarter has been reviewed; days 2–7 are retries.
+    scheduler.add_job(
+        quarterly_compliance_job,
+        trigger=CronTrigger(
+            month="3,6,9,12",
+            day="1-7",
+            hour=7,
+            minute=0,
+            timezone="America/New_York",
+        ),
+        id="quarterly_compliance",
+        name="Quarterly compliance review",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Purification ledger sync — Saturdays at 07:00 ET
+    scheduler.add_job(
+        purification_sync_job,
+        trigger=CronTrigger(
+            day_of_week="sat",
+            hour=7,
+            minute=0,
+            timezone="America/New_York",
+        ),
+        id="purification_sync",
+        name="Purification dividend sync",
         max_instances=1,
         coalesce=True,
     )
